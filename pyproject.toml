@@ -21,8 +21,8 @@ classifiers = [
 requires-python = ">=3.12"
 dynamic = ["version"]
 dependencies = [
-    "xarray>=2025.06.0",  # first version compatible with zarr 3.1.x fill value dtype handling
-    "numpy>=2.1.0",  # first version with Python 3.13 wheels
+    "xarray>=2025.06.0", # first version compatible with zarr 3.1.x fill value dtype handling
+    "numpy>=2.1.0", # first version with Python 3.13 wheels
     "universal-pathlib",
     "numcodecs>=0.15.1",
     "ujson",
@@ -30,6 +30,8 @@ dependencies = [
     "zarr>=3.1.0",
     "obstore>=0.7.0",
     "obspec_utils>=0.9.0",
+    "kerchunk>=0.2.10",
+    "arro3-core>=0.8.0",
 ]
 
 # Dependency sets under optional-dependencies are available via PyPI

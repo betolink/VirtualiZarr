@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from concurrent.futures import Executor
 from functools import partial
@@ -14,6 +15,7 @@ from typing import (
     cast,
 )
 
+import numpy as np
 import xarray as xr
 import xarray.indexes
 from obspec_utils.registry import ObjectStoreRegistry
@@ -248,6 +250,487 @@ def open_virtual_dataset(
     return ds
 
 
+def _is_virtual_variable(var: xr.Variable) -> bool:
+    """Return True if the variable is backed by a ManifestArray."""
+    return isinstance(var.data, ManifestArray)
+
+
+def _compute_pad_targets(
+    datasets: list[xr.Dataset],
+    scope_dims: set[str] | None,
+) -> dict[str, int]:
+    """Compute max sizes per-dim across datasets, only for dims that differ.
+
+    If *scope_dims* is given, only those dims are considered.
+    """
+    dim_sets: dict[str, set[int]] = {}
+    for ds in datasets:
+        for dim, size in ds.sizes.items():
+            if scope_dims is not None and dim not in scope_dims:
+                continue
+            dim_sets.setdefault(dim, set()).add(size)
+
+    targets: dict[str, int] = {}
+    for dim, sizes in dim_sets.items():
+        if len(sizes) > 1:
+            targets[dim] = max(sizes)
+    return targets
+
+
+def _apply_pad_to_dataset(
+    ds: xr.Dataset,
+    targets: dict[str, int],
+    target_chunks_map: dict[str, tuple[int, ...]] | None = None,
+) -> tuple[xr.Dataset, dict[str, int]]:
+    """Pad a Dataset's ManifestArray-backed variables to given dim targets,
+    then normalize chunk shapes if *target_chunks_map* is provided.
+
+    Returns (padded_ds, report_dict) where report_dict maps dim -> target.
+    """
+    report: dict[str, int] = {}
+    padded_vars: dict[str, xr.Variable] = {}
+    for name, var in ds.variables.items():
+        if not _is_virtual_variable(var):
+            continue
+        ma: ManifestArray = var.data
+
+        new_shape = list(ma.shape)
+        for ax, (dim_name, old_len) in enumerate(zip(var.dims, ma.shape)):
+            t = targets.get(dim_name)
+            if t is not None and t > old_len:
+                new_shape[ax] = t
+                report[dim_name] = max(report.get(dim_name, 0), t)
+
+        if target_chunks_map and name in target_chunks_map:
+            tc = target_chunks_map[name]
+            if tuple(tc) != tuple(ma.chunks):
+                ma = ma._remap_chunks(tc)
+
+        new_shape_t = tuple(new_shape)
+        if new_shape_t != ma.shape:
+            ma = ma.pad_to_shape(new_shape_t)
+
+        padded_vars[name] = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
+
+    for name, var in ds.variables.items():
+        if name not in padded_vars:
+            padded_vars[name] = var
+
+    for dim in targets:
+        old_size = ds.sizes.get(dim)
+        new_size = report.get(dim)
+        if old_size is not None and new_size is not None and old_size != new_size:
+            coord_var = ds.variables.get(dim)
+            if coord_var is not None and coord_var.dims == (dim,):
+                if not _is_virtual_variable(coord_var):
+                    raise ValueError(
+                        f"Padded dimension '{dim}' from {old_size} to "
+                        f"{new_size}, but a loaded 1D coordinate variable "
+                        f"exists. Drop it in your preprocess function."
+                    )
+
+    new_ds = construct_fully_virtual_dataset(padded_vars, attrs=ds.attrs)
+    return new_ds, report
+
+
+def _is_regular_coord(arr: "np.ndarray") -> bool:
+    """Return True iff *arr* is a 1-D array with uniform non-zero spacing."""
+
+    arr = np.asarray(arr)
+    if arr.ndim != 1 or arr.size < 2:
+        return arr.size == 1  # single-element is trivially regular
+    diffs = np.diff(arr.astype("float64"))
+    if not np.isfinite(diffs).all():
+        return False
+    step = diffs[0]
+    if step == 0.0:
+        return False
+    return bool(np.allclose(diffs, step, rtol=1e-9, atol=0.0))
+
+
+def _build_union_coord(arrays: "list[np.ndarray]") -> "np.ndarray":
+    """Build a regular union coordinate from a list of 1-D regular coordinate arrays.
+
+    All arrays must share the same uniform spacing (sign and magnitude).
+    The union grid is the smallest regular grid that contains every element of
+    every input array.
+
+    Raises
+    ------
+    ValueError
+        If any array is irregular, if spacings differ, or if any array is not
+        on the common grid (grid misalignment).
+    """
+
+    if not arrays:
+        raise ValueError("arrays must be non-empty")
+
+    arrays = [np.asarray(a, dtype="float64") for a in arrays]
+
+    # validate regularity of each array
+    for i, a in enumerate(arrays):
+        if not _is_regular_coord(a):
+            raise ValueError(
+                f"Array {i} is not a regular (uniformly-spaced) coordinate."
+            )
+
+    # determine common step from the first multi-element array
+    step: float | None = None
+    for a in arrays:
+        if a.size >= 2:
+            s = float(np.diff(a)[0])
+            if step is None:
+                step = s
+            elif not np.isclose(s, step, rtol=1e-9, atol=0.0):
+                raise ValueError(
+                    f"Coordinate spacing mismatch: expected {step} but got {s}. "
+                    "All coordinate arrays must share the same spacing."
+                )
+
+    if step is None:
+        # all single-element: just unique values
+        return np.unique(np.concatenate(arrays))
+
+    # union extents
+    if step > 0:
+        global_min = float(min(a[0] for a in arrays))
+        global_max = float(max(a[-1] for a in arrays))
+    else:
+        global_min = float(min(a[-1] for a in arrays))
+        global_max = float(max(a[0] for a in arrays))
+
+    # check grid alignment: each array's first element must be on the global grid
+    for i, a in enumerate(arrays):
+        offset = (a[0] - global_min if step > 0 else global_max - a[0])
+        if not np.isclose(offset % abs(step), 0.0, atol=abs(step) * 1e-6):
+            raise ValueError(
+                f"Array {i} is not aligned to the common grid "
+                f"(global_min={global_min}, step={step}, a[0]={a[0]}, "
+                f"remainder={offset % abs(step)})."
+            )
+
+    n = round((global_max - global_min) / abs(step)) + 1
+    return np.linspace(global_min if step > 0 else global_max,
+                       global_max if step > 0 else global_min,
+                       n)
+
+
+# ---------------------------------------------------------------------------
+# Mosaic helpers
+# ---------------------------------------------------------------------------
+
+def _compute_mosaic_plan(
+    datasets: "list[xr.Dataset]",
+    mosaic_dims: "list[str]",
+) -> "tuple[dict[str, np.ndarray], dict[str, list[int]]]":
+    """Validate coords and compute the union grid for each mosaic dimension.
+
+    Parameters
+    ----------
+    datasets
+        List of virtual datasets (after optional preprocessing).
+    mosaic_dims
+        Dimension names to mosaic spatially (e.g. ``['y', 'x']``).
+
+    Returns
+    -------
+    union_coords : dict[dim, 1-D float64 array]
+        The union coordinate array for each mosaic dim.
+    offsets : dict[dim, list[int]]
+        For each mosaic dim, the element-level offset of each dataset's
+        coordinate within the union grid (length = len(datasets)).
+
+    Raises
+    ------
+    ValueError
+        If any mosaic-dim coordinate is still virtual, irregular, or
+        misaligned across datasets.
+    """
+
+    union_coords: dict[str, np.ndarray] = {}
+    offsets: dict[str, list[int]] = {}
+
+    for dim in mosaic_dims:
+        coord_arrays: list[np.ndarray] = []
+        for i, ds in enumerate(datasets):
+            if dim not in ds.variables:
+                raise ValueError(
+                    f"mosaic_dims: dimension '{dim}' has no coordinate variable "
+                    f"in dataset {i}."
+                )
+            var = ds.variables[dim]
+            if _is_virtual_variable(var):
+                raise ValueError(
+                    f"mosaic_dims: coordinate '{dim}' is still virtual in dataset {i}. "
+                    f"Add '{dim}' to loadable_variables so it is loaded into memory "
+                    "before mosaicking."
+                )
+            coord_arrays.append(np.asarray(var.values, dtype="float64"))
+
+        # _build_union_coord validates regularity, consistent spacing, alignment
+        union = _build_union_coord(coord_arrays)
+        union_coords[dim] = union
+
+        step = float(np.diff(union)[0]) if union.size >= 2 else 1.0
+        dim_offsets: list[int] = []
+        for ca in coord_arrays:
+            # find the index in the union where this coord starts
+            # step may be negative (e.g. decreasing y), so use signed division
+            start_val = float(ca[0])
+            idx = round((start_val - float(union[0])) / step)
+            dim_offsets.append(int(idx))
+        offsets[dim] = dim_offsets
+
+    return union_coords, offsets
+
+
+def _apply_mosaic_to_dataset(
+    ds: "xr.Dataset",
+    ds_idx: int,
+    mosaic_dims: "list[str]",
+    union_coords: "dict[str, np.ndarray]",
+    offsets: "dict[str, list[int]]",
+) -> "xr.Dataset":
+    """Place a single dataset's virtual arrays into the union grid.
+
+    For each virtual variable whose dimensions include a mosaic dim:
+    1. Remap the ManifestArray to chunk_size=1 on every mosaic axis (so any
+       element offset is chunk-aligned).
+    2. Call ``place_in_grid`` with the correct element offset.
+
+    Loaded 1-D coordinate variables for mosaic dims are replaced with the
+    union coordinate array.
+    """
+
+    new_vars: dict[str, xr.Variable] = {}
+
+    # union shape for each mosaic dim
+    union_sizes = {dim: int(union_coords[dim].size) for dim in mosaic_dims}
+
+    for name, var in ds.variables.items():
+        if not _is_virtual_variable(var):
+            # Replace loaded 1-D coord if it is a mosaic dim
+            if var.dims == (name,) and name in mosaic_dims:
+                union_arr = union_coords[name]
+                new_vars[name] = xr.Variable(
+                    dims=(name,), data=union_arr, attrs=var.attrs
+                )
+            else:
+                new_vars[name] = var
+            continue
+
+        ma: ManifestArray = var.data
+        dims = var.dims
+
+        # check whether any mosaic dim appears in this variable's dimensions
+        mosaic_axes = [
+            ax for ax, d in enumerate(dims) if d in mosaic_dims
+        ]
+        if not mosaic_axes:
+            new_vars[name] = var
+            continue
+
+        # --- step 1: build new_shape and element offset for place_in_grid ---
+        original_chunks = ma.chunks
+        new_shape = list(ma.shape)
+        elem_offset = [0] * ma.ndim
+        for ax, dim in enumerate(dims):
+            if dim in mosaic_dims:
+                new_shape[ax] = union_sizes[dim]
+                elem_offset[ax] = offsets[dim][ds_idx]
+
+        # --- step 2: place chunks into the union grid ---
+        #
+        # Fast path (chunk-aligned offset, works for compressed data too):
+        # When the element offset on every mosaic axis is an exact multiple of
+        # the chunk size on that axis, existing chunk boundaries map directly
+        # onto the union grid.  We can call place_in_grid with the original
+        # chunks without splitting or decompressing anything.
+        #
+        # Slow path (uncompressed data only):
+        # When the offset is NOT chunk-aligned on some axis we fall back to
+        # _remap_chunks (chunk_size=1) + place_in_grid + consolidate_chunks.
+        # This requires uncompressed data because it byte-splits chunks.
+
+        chunk_aligned = all(
+            elem_offset[ax] % original_chunks[ax] == 0
+            for ax in mosaic_axes
+        )
+
+        if chunk_aligned:
+            # Fast path: place whole chunks directly — safe for compressed data.
+            ma = ma.place_in_grid(tuple(new_shape), tuple(elem_offset), policy="error")
+        else:
+            # Slow path: requires uncompressed data.
+            target_chunks = list(original_chunks)
+            for ax in mosaic_axes:
+                target_chunks[ax] = 1
+            ma = ma._remap_chunks(tuple(target_chunks))
+            ma = ma.place_in_grid(tuple(new_shape), tuple(elem_offset), policy="error")
+
+            # Consolidate sub-chunks back to original chunk sizes where the
+            # union shape is divisible by the original chunk size.
+            consolidate_target = list(ma.chunks)
+            any_consolidation = False
+            for ax in mosaic_axes:
+                desired = original_chunks[ax]
+                if desired > 1 and ma.shape[ax] % desired == 0:
+                    consolidate_target[ax] = desired
+                    any_consolidation = True
+            if any_consolidation:
+                try:
+                    ma = ma.consolidate_chunks(tuple(consolidate_target))
+                except ValueError:
+                    # Non-contiguous or cross-file sub-chunks: leave as-is.
+                    pass
+
+        new_vars[name] = xr.Variable(dims=dims, data=ma, attrs=var.attrs)
+
+    return construct_fully_virtual_dataset(new_vars, attrs=ds.attrs)
+
+
+def _resolve_pad_scope(
+    pad: str | Mapping[str, int | None],
+    datasets: list[xr.Dataset],
+) -> set[str] | None:
+    """Convert the user `pad` argument to a set of dims to consider.
+
+    Returns None for the special ``"auto"`` mode (means "inspect all").
+    """
+    if isinstance(pad, str):
+        if pad == "auto":
+            return None
+        raise ValueError(
+            f"Invalid pad value: '{pad}'. Expected 'auto', 'none', "
+            "or a dict of dim -> target."
+        )
+    return set(pad.keys())
+
+
+def _collect_explicit_targets(
+    pad: str | Mapping[str, int | None],
+) -> dict[str, int]:
+    """Extract explicit (non-None) integer targets from a pad mapping."""
+    if isinstance(pad, str):
+        return {}
+    return {dim: val for dim, val in pad.items() if isinstance(val, int)}
+
+
+def _compute_common_chunks(
+    datasets: list[xr.Dataset],
+    pad_dims: set[str] | None = None,
+) -> dict[str, tuple[int, ...]]:
+    """Compute common chunk shape per variable when chunk shapes differ.
+
+    For uncompressed variables on padded dims, uses chunk size 1 so that any
+    pad target is chunk-aligned (safe for contiguous/uncompressed data where
+    ``_remap_chunks`` can split byte ranges).  For compressed variables the
+    chunk sizes should already match; if they differ we use the minimum
+    (``_remap_chunks`` will raise if called on compressed data).
+    For non-pad dims the element-wise minimum across datasets is used.
+    """
+    from virtualizarr.codecs import is_uncompressed
+
+    pad_dims = pad_dims or set()
+    var_chunks: dict[str, set[tuple[int, ...]]] = {}
+    var_dims: dict[str, tuple[str, ...]] = {}
+    var_compressed: dict[str, bool] = {}  # True if ANY array for this var is compressed
+    for ds in datasets:
+        for name, var in ds.variables.items():
+            if _is_virtual_variable(var):
+                ma = var.data
+                var_chunks.setdefault(name, set()).add(ma.chunks)
+                var_dims.setdefault(name, var.dims)
+                if not is_uncompressed(ma):
+                    var_compressed[name] = True
+
+    common: dict[str, tuple[int, ...]] = {}
+    for name, chunk_set in var_chunks.items():
+        dims = var_dims.get(name, ())
+        if len(chunk_set) > 1:
+            zipped = zip(*chunk_set)
+            parts: list[int] = []
+            compressed = var_compressed.get(name, False)
+            for ax, dim_values in enumerate(zipped):
+                if ax < len(dims) and dims[ax] in pad_dims and not compressed:
+                    # uncompressed on a pad dim: use chunk_size=1 so any pad
+                    # target is chunk-aligned after _remap_chunks splits bytes
+                    parts.append(1)
+                else:
+                    parts.append(min(dim_values))
+            common[name] = tuple(parts)
+    return common
+
+
+def _emit_pad_warning(report: dict[str, int], stage: str = "") -> None:
+    """Emit a single warning summarizing padding actions."""
+    if not report:
+        return
+    stage_prefix = f"[{stage}] " if stage else ""
+    dims_str = ", ".join(f"{d}={s}" for d, s in sorted(report.items()))
+    warnings.warn(
+        f"{stage_prefix}Applied padding: {dims_str}"
+    )
+
+
+def _nested_combine_with_padding(
+    datasets: list[xr.Dataset],
+    concat_dims: list,
+    ids: list,
+    pad_scope: set[str] | None,
+    explicit_targets: dict[str, int],
+    pad_warn: bool,
+) -> xr.Dataset:
+    parts = list(datasets)
+    total_report: dict[str, int] = {}
+    step_ids: list = list(ids)
+
+    for level, dim in enumerate(concat_dims):
+        if len(parts) == 1:
+            break
+
+        auto = _compute_pad_targets(parts, pad_scope)
+        targets = {**auto, **explicit_targets}
+        chunk_map = _compute_common_chunks(parts, pad_dims=set(targets.keys()))
+        if targets or chunk_map:
+            padded = []
+            for ds in parts:
+                ds2, rep = _apply_pad_to_dataset(ds, targets, chunk_map)
+                padded.append(ds2)
+                total_report.update(rep)
+            parts = padded
+
+        if level < len(concat_dims) - 1 and step_ids and len(step_ids[0]) > 1:
+            depth = level + 1
+            groups: dict[tuple, list[int]] = {}
+            for i, sid in enumerate(step_ids):
+                sid_t = tuple(sid) if isinstance(sid, tuple) else (sid,)
+                groups.setdefault(sid_t[:depth], []).append(i)
+            next_parts, next_ids = [], []
+            for prefix, indices in groups.items():
+                next_parts.append(xr.concat([parts[i] for i in indices], dim=dim))
+                next_ids.append(prefix)
+            parts, step_ids = next_parts, next_ids
+        else:
+            result = xr.concat(parts, dim=dim)
+            parts = [result]
+
+        auto2 = _compute_pad_targets(parts, pad_scope)
+        targets2 = {**auto2, **explicit_targets}
+        chunk_map2 = _compute_common_chunks(parts, pad_dims=set(targets2.keys()))
+        if targets2 or chunk_map2:
+            padded2 = []
+            for ds in parts:
+                ds3, rep2 = _apply_pad_to_dataset(ds, targets2, chunk_map2)
+                padded2.append(ds3)
+                total_report.update(rep2)
+            parts = padded2
+
+    if pad_warn:
+        _emit_pad_warning(total_report)
+    return parts[0]
+
+
 def open_virtual_mfdataset(
     urls: (
         str
@@ -275,6 +758,10 @@ def open_virtual_mfdataset(
     join: "JoinOptions" = "outer",
     attrs_file: str | os.PathLike | None = None,
     combine_attrs: "CombineAttrsOptions" = "override",
+    pad: Literal["auto", "none"] | Mapping[str, int | None] = "auto",
+    pad_policy: Literal["round_to_chunks", "error"] = "round_to_chunks",
+    pad_warn: bool = True,
+    mosaic_dims: "list[str] | None" = None,
     **kwargs,
 ) -> Dataset:
     """
@@ -374,9 +861,48 @@ def open_virtual_mfdataset(
     make_executor = get_executor(parallel=parallel)
 
     with make_executor() as exec:
-        # Wait for all the workers to finish, and send their resulting virtual
-        # datasets back to the client for concatenation there.
         virtual_datasets = list(exec.map(mapper, paths1d))
+
+    # --- mosaic: place each dataset into a shared spatial union grid ---
+    if mosaic_dims:
+        union_coords, offsets = _compute_mosaic_plan(virtual_datasets, mosaic_dims)
+        virtual_datasets = [
+            _apply_mosaic_to_dataset(ds, i, mosaic_dims, union_coords, offsets)
+            for i, ds in enumerate(virtual_datasets)
+        ]
+
+    if pad != "none":
+        pad_scope = _resolve_pad_scope(pad, virtual_datasets)
+        explicit_targets = _collect_explicit_targets(pad)
+
+        if combine == "by_coords":
+            auto_targets = _compute_pad_targets(virtual_datasets, pad_scope)
+            targets = {**auto_targets, **explicit_targets}
+            chunk_map = _compute_common_chunks(
+                virtual_datasets, pad_dims=set(targets.keys())
+            )
+
+            full_report: dict[str, int] = {}
+            padded_datasets: list[Dataset] = []
+            for ds in virtual_datasets:
+                padded_ds, rep = _apply_pad_to_dataset(ds, targets, chunk_map)
+                padded_datasets.append(padded_ds)
+                full_report.update(rep)
+            virtual_datasets = padded_datasets
+
+            if pad_warn:
+                _emit_pad_warning(full_report)
+
+        elif combine == "nested":
+            staged = _nested_combine_with_padding(
+                virtual_datasets,
+                concat_dims=concat_dim,
+                ids=ids,
+                pad_scope=pad_scope,
+                explicit_targets=explicit_targets,
+                pad_warn=pad_warn,
+            )
+            return staged
 
     # TODO add file closers
 

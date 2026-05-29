@@ -435,6 +435,20 @@ class ChunkManifest:
     def items(self) -> ItemsView:
         return self.dict().items()
 
+    def _iterate_chunk_keys_with_paths(self) -> Iterator[tuple[str, str]]:
+        """
+        Iterate over all chunk keys (including missing chunks) yielding
+        ``(chunk_key, path)`` pairs.  Missing chunks have ``path == MISSING_CHUNK_PATH``.
+        """
+        coord_vectors = np.mgrid[
+            tuple(slice(None, length) for length in self.shape_chunk_grid)
+        ]
+        for *inds, path in np.nditer(
+            [*coord_vectors, self._paths],
+            flags=("refs_ok",),
+        ):
+            yield join(inds), path.item()
+
     def dict(self) -> ChunkDict:  # type: ignore[override]
         """
         Convert the entire manifest to a nested dictionary.

@@ -106,17 +106,54 @@ def remove_file_uri_prefix(path: str):
         return path
 
 
+def _fill_chunk_bytes(marr: "ManifestArray", chunk_key: str) -> bytes:
+    """
+    Return the encoded bytes for a missing chunk: a C-contiguous array of the
+    chunk's shape filled with the array's fill_value, encoded with the same
+    filters and compressor as real chunks so that zarr can decode them.
+
+    These bytes are inlined into kerchunk refs so that fsspec can return them
+    directly without attempting a network/file fetch for missing chunks.
+    """
+
+    v2_meta = convert_v3_to_v2_metadata(marr.metadata)
+    dtype = np.dtype(str(marr.dtype))
+    fill_value = v2_meta.fill_value
+
+    # chunk_shape is taken directly from the ManifestArray metadata.
+    chunk_shape = marr.chunks
+
+    fill_array = np.full(chunk_shape, fill_value=fill_value, dtype=dtype)
+    buf: bytes = fill_array.tobytes(order="C")
+
+    # Apply filters in order (same as zarr v2 encode path), then compressor.
+    filters = v2_meta.filters or []
+    for filt in filters:
+        buf = filt.encode(buf)
+    if v2_meta.compressor is not None:
+        buf = v2_meta.compressor.encode(buf)
+
+    return buf
+
+
 def variable_to_kerchunk_arr_refs(var: Variable, var_name: str) -> KerchunkArrRefs:
     """
     Create a dictionary containing kerchunk-style array references from a single xarray.Variable (which wraps either a ManifestArray or a numpy array).
 
     Partially encodes the inner dicts to json to match kerchunk behaviour (see https://github.com/fsspec/kerchunk/issues/415).
+
+    Missing chunks (those with MISSING_CHUNK_PATH) are serialized as inlined
+    fill-value bytes so that kerchunk parquet can represent them without storing
+    a NaN/None URL path (which fsspec cannot handle).
     """
+    from virtualizarr.manifests.manifest import MISSING_CHUNK_PATH
 
     if isinstance(var.data, ManifestArray):
         marr = var.data
 
         arr_refs: dict[str, str | list[str | int]] = {}
+
+        # Emit real and inlined chunks from manifest.dict()
         for chunk_key, entry in marr.manifest.dict().items():
             if "data" in entry:
                 # Inlined chunk: emit as kerchunk's `base64:<b64>` form.
@@ -129,6 +166,18 @@ def variable_to_kerchunk_arr_refs(var: Variable, var_name: str) -> KerchunkArrRe
                     entry["offset"],
                     entry["length"],
                 ]
+
+        # Emit missing chunks as inlined fill-value bytes.
+        # This is required for kerchunk parquet: a None/NaN path column entry
+        # round-trips through pandas as float NaN, which fsspec cannot handle.
+        # Inlining fill bytes makes missing chunks self-contained in the refs.
+        for chunk_key, _path in marr.manifest._iterate_chunk_keys_with_paths():
+            if _path == MISSING_CHUNK_PATH:
+                fill_bytes = _fill_chunk_bytes(marr, chunk_key)
+                arr_refs[chunk_key] = (
+                    b"base64:" + base64.b64encode(fill_bytes)
+                ).decode("utf-8")
+
         array_v2_metadata = convert_v3_to_v2_metadata(marr.metadata)
         zattrs = {**var.attrs, **var.encoding}
     else:

@@ -1,6 +1,6 @@
 import dataclasses
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Union, cast
 
 import numpy as np
 import xarray as xr
@@ -12,9 +12,12 @@ from virtualizarr.manifests.array_api import (
     _isnan,
 )
 from virtualizarr.manifests.indexing import T_Indexer, index
-from virtualizarr.manifests.manifest import ChunkManifest
-from virtualizarr.manifests.utils import ChunkKeySeparator
-from virtualizarr.utils import determine_chunk_grid_shape
+from virtualizarr.manifests.manifest import MISSING_CHUNK_PATH, ChunkManifest
+from virtualizarr.manifests.utils import (
+    ChunkKeySeparator,
+    copy_and_replace_metadata,
+)
+from virtualizarr.utils import ceildiv, determine_chunk_grid_shape
 
 if TYPE_CHECKING:
     from zarr.core.metadata.v3 import RegularChunkGridMetadata
@@ -332,6 +335,383 @@ class ManifestArray:
             entries={}, shape=determine_chunk_grid_shape(self.shape, self.chunks)
         )
         return ManifestArray(metadata=new_metadata, chunkmanifest=empty_manifest)
+
+    def place_in_grid(
+        self,
+        new_shape: tuple[int, ...],
+        offset: tuple[int, ...],
+        *,
+        policy: Literal["round_to_chunks", "error"] = "round_to_chunks",
+    ) -> "ManifestArray":
+        """
+        Place this ManifestArray at *offset* inside a larger *new_shape* grid.
+
+        The existing chunk references are copied to their offset position; every
+        other cell in the new grid becomes a missing chunk (returns ``fill_value``
+        on read).
+
+        ``place_in_grid(new_shape, offset=(0, 0, ...))`` is equivalent to
+        ``pad_to_shape(new_shape)``.
+
+        Parameters
+        ----------
+        new_shape
+            Target shape of the returned array.
+        offset
+            Element-wise offset for each axis. Must be a multiple of
+            ``chunks[ax]`` on each axis (verified by *policy*).
+        policy
+            ``"round_to_chunks"`` (default): round any non-aligned offset up to
+            the next chunk boundary and emit a warning.
+            ``"error"``: raise ``ValueError`` if any offset is not chunk-aligned.
+        """
+        chunks = self.chunks
+        new_shape = tuple(new_shape)
+        offset = tuple(offset)
+
+        if len(new_shape) != self.ndim or len(offset) != self.ndim:
+            raise ValueError(
+                f"new_shape and offset must both have length {self.ndim}"
+            )
+
+        # --- align offsets to chunk boundaries ---
+        aligned_offset = list(offset)
+        any_rounded = False
+        for ax in range(self.ndim):
+            if offset[ax] % chunks[ax] != 0:
+                if policy == "error":
+                    raise ValueError(
+                        f"offset[{ax}]={offset[ax]} is not chunk-aligned "
+                        f"(chunk size={chunks[ax]}). Use policy='round_to_chunks'."
+                    )
+                aligned_offset[ax] = ceildiv(offset[ax], chunks[ax]) * chunks[ax]
+                any_rounded = True
+        if any_rounded:
+            warnings.warn(
+                f"place_in_grid rounded offset from {offset} to "
+                f"{tuple(aligned_offset)} to align with chunk boundaries {chunks}"
+            )
+        offset = tuple(aligned_offset)
+
+        # --- validate new_shape fits the array at the given offset ---
+        for ax in range(self.ndim):
+            needed = offset[ax] + self.shape[ax]
+            if new_shape[ax] < needed:
+                raise ValueError(
+                    f"new_shape[{ax}]={new_shape[ax]} is too small: "
+                    f"offset[{ax}]={offset[ax]} + shape[{ax}]={self.shape[ax]} "
+                    f"= {needed} > {new_shape[ax]}"
+                )
+            if new_shape[ax] < self.shape[ax] and offset[ax] == 0:
+                raise ValueError(
+                    f"new_shape[{ax}]={new_shape[ax]} < shape[{ax}]={self.shape[ax]}; "
+                    "shrinking is not supported"
+                )
+
+        old_grid = determine_chunk_grid_shape(self.shape, chunks)
+        new_grid = determine_chunk_grid_shape(new_shape, chunks)
+        chunk_offset = tuple(offset[ax] // chunks[ax] for ax in range(self.ndim))
+
+        # fast path: nothing actually changes
+        if chunk_offset == tuple(0 for _ in range(self.ndim)) and new_grid == old_grid:
+            new_meta = copy_and_replace_metadata(self.metadata, new_shape=list(new_shape))
+            return ManifestArray(metadata=new_meta, chunkmanifest=self.manifest)
+
+        new_paths = np.full(new_grid, MISSING_CHUNK_PATH, dtype=np.dtypes.StringDType())
+        new_offsets = np.zeros(new_grid, dtype=np.dtype("uint64"))
+        new_lengths = np.zeros(new_grid, dtype=np.dtype("uint64"))
+
+        dest = tuple(
+            slice(chunk_offset[ax], chunk_offset[ax] + old_grid[ax])
+            for ax in range(self.ndim)
+        )
+        new_paths[dest] = self.manifest._paths
+        new_offsets[dest] = self.manifest._offsets
+        new_lengths[dest] = self.manifest._lengths
+
+        new_manifest = ChunkManifest.from_arrays(
+            paths=new_paths,
+            offsets=new_offsets,
+            lengths=new_lengths,
+            validate_paths=False,
+            inlined=dict(self.manifest._inlined) if self.manifest._inlined else None,
+        )
+        new_meta = copy_and_replace_metadata(self.metadata, new_shape=list(new_shape))
+        return ManifestArray(metadata=new_meta, chunkmanifest=new_manifest)
+
+    def pad_to_shape(
+        self,
+        new_shape: tuple[int, ...],
+        *,
+        policy: Literal["round_to_chunks", "error"] = "round_to_chunks",
+    ) -> "ManifestArray":
+        """
+        Pad this ManifestArray to a larger shape by expanding the chunk manifest.
+
+        New chunk-grid cells are initialized as missing chunks (return ``fill_value``
+        on read). Existing chunk references are copied unchanged.
+
+        Parameters
+        ----------
+        new_shape
+            Target array shape. Must be elementwise >= the current shape.
+        policy
+            ``"round_to_chunks"`` (default): round ``new_shape`` up to the next
+            multiple of ``chunks[axis]`` on any axis where it is not chunk-aligned.
+            ``"error"``: raise ``ValueError`` if ``new_shape[axis]`` is not a
+            multiple of ``chunks[axis]``.
+
+        Returns
+        -------
+        ManifestArray
+        """
+        old_shape = self.shape
+        chunks = self.chunks
+        new_shape = tuple(new_shape)
+
+        if len(new_shape) != self.ndim:
+            raise ValueError(
+                f"new_shape length {len(new_shape)} must match ndim {self.ndim}"
+            )
+        for ax, (o, n) in enumerate(zip(old_shape, new_shape)):
+            if n < o:
+                raise ValueError(
+                    f"new_shape[{ax}]={n} < old_shape[{ax}]={o}; "
+                    "only padding (enlarging) is supported"
+                )
+
+        if policy == "round_to_chunks":
+            rounded = list(new_shape)
+            any_rounded = False
+            for ax in range(self.ndim):
+                if new_shape[ax] % chunks[ax] != 0:
+                    rounded[ax] = ceildiv(new_shape[ax], chunks[ax]) * chunks[ax]
+                    any_rounded = True
+            if any_rounded:
+                warnings.warn(
+                    f"pad_to_shape rounded new_shape from {new_shape} to "
+                    f"{tuple(rounded)} to align with chunk boundaries {chunks}"
+                )
+                new_shape = tuple(rounded)
+        elif policy == "error":
+            for ax in range(self.ndim):
+                if new_shape[ax] % chunks[ax] != 0:
+                    raise ValueError(
+                        f"axis {ax}: length {new_shape[ax]} is not a multiple of "
+                        f"chunk size {chunks[ax]}. Use policy='round_to_chunks'."
+                    )
+        else:
+            raise ValueError(f"Unknown policy: {policy!r}")
+
+        zero_offset = tuple(0 for _ in range(self.ndim))
+        return self.place_in_grid(new_shape, zero_offset, policy="error")
+
+    def _remap_chunks(self, new_chunks: tuple[int, ...]) -> "ManifestArray":
+        """Return a new array with the same shape but remapped to *new_chunks*.
+
+        Each existing chunk entry is split into sub-entries aligned with
+        *new_chunks*.  Requires ``new_chunks[ax] <= chunks[ax]`` on every axis.
+
+        Raises ``ValueError`` if the array has any bytes-to-bytes compression
+        codec, because byte-splitting compressed chunks produces corrupt data.
+        """
+        from virtualizarr.codecs import is_uncompressed
+
+        if not is_uncompressed(self):
+            raise ValueError(
+                "_remap_chunks cannot be called on a compressed ManifestArray. "
+                "Byte-splitting compressed chunks would produce corrupt virtual "
+                "references. Ensure chunk shapes are consistent across files, or "
+                "use uncompressed storage."
+            )
+        old_chunks = self.chunks
+        old_shape = self.shape
+        new_grid = determine_chunk_grid_shape(old_shape, new_chunks)
+        old_grid = determine_chunk_grid_shape(old_shape, old_chunks)
+        elem_bytes = self.dtype.itemsize
+
+        paths = np.full(new_grid, MISSING_CHUNK_PATH, dtype=np.dtypes.StringDType())
+        offsets = np.zeros(new_grid, dtype=np.dtype("uint64"))
+        lengths = np.zeros(new_grid, dtype=np.dtype("uint64"))
+
+        for old_idx in np.ndindex(*old_grid):
+            entry = self.manifest.get_entry(old_idx)
+            if entry is None:
+                continue
+
+            start = tuple(old_idx[ax] * old_chunks[ax] for ax in range(self.ndim))
+            end = tuple(
+                min(start[ax] + old_chunks[ax], old_shape[ax])
+                for ax in range(self.ndim)
+            )
+            dims = tuple(end[ax] - start[ax] for ax in range(self.ndim))
+
+            i0 = tuple(start[ax] // new_chunks[ax] for ax in range(self.ndim))
+            i1 = tuple(
+                (end[ax] - 1) // new_chunks[ax] + 1 for ax in range(self.ndim)
+            )
+
+            for sub_idx in np.ndindex(
+                *tuple(max(i1[ax] - i0[ax], 0) for ax in range(self.ndim))
+            ):
+                new_idx = tuple(i0[ax] + sub_idx[ax] for ax in range(self.ndim))
+                seg_start = tuple(
+                    max(start[ax], new_idx[ax] * new_chunks[ax])
+                    for ax in range(self.ndim)
+                )
+                seg_end = tuple(
+                    min(end[ax], (new_idx[ax] + 1) * new_chunks[ax])
+                    for ax in range(self.ndim)
+                )
+                if any(seg_end[ax] <= seg_start[ax] for ax in range(self.ndim)):
+                    continue
+
+                rel = tuple(seg_start[ax] - start[ax] for ax in range(self.ndim))
+                sz = tuple(seg_end[ax] - seg_start[ax] for ax in range(self.ndim))
+
+                elem_off = 0
+                stride = 1
+                for ax in range(self.ndim - 1, -1, -1):
+                    elem_off += rel[ax] * stride
+                    stride *= dims[ax]
+                elem_cnt = int(np.prod(sz))
+
+                paths[new_idx] = entry["path"]
+                offsets[new_idx] = int(entry["offset"]) + elem_off * elem_bytes
+                lengths[new_idx] = elem_cnt * elem_bytes
+
+        new_manifest = ChunkManifest.from_arrays(
+            paths=paths, offsets=offsets, lengths=lengths, validate_paths=False
+        )
+        new_meta = copy_and_replace_metadata(
+            self.metadata, new_shape=list(old_shape), new_chunks=list(new_chunks)
+        )
+        return ManifestArray(metadata=new_meta, chunkmanifest=new_manifest)
+
+    def consolidate_chunks(
+        self, target_chunks: tuple[int, ...]
+    ) -> "ManifestArray":
+        """Return a new ManifestArray whose chunk shape is *target_chunks*.
+
+        Each target chunk must contain only sub-chunks that share the same
+        source URL and form a single contiguous byte range (as produced by
+        ``_remap_chunks`` followed by ``place_in_grid``).  When that condition
+        holds the sub-chunks are merged back into one manifest entry.
+
+        A target chunk cell is emitted as **missing** when every contributing
+        sub-chunk in the current manifest is already missing.
+
+        Raises ``ValueError`` if any target chunk contains sub-chunks from
+        different source files, or sub-chunks whose byte ranges are not
+        contiguous.
+
+        Parameters
+        ----------
+        target_chunks
+            The desired chunk shape after consolidation.  Must satisfy
+            ``target_chunks[ax] >= self.chunks[ax]`` on every axis, and each
+            ``target_chunks[ax]`` must be a multiple of ``self.chunks[ax]``.
+        """
+        if len(target_chunks) != self.ndim:
+            raise ValueError(
+                f"target_chunks must have length {self.ndim}, "
+                f"but got {len(target_chunks)}"
+            )
+        for ax in range(self.ndim):
+            if target_chunks[ax] < self.chunks[ax]:
+                raise ValueError(
+                    f"target_chunks[{ax}]={target_chunks[ax]} < "
+                    f"current chunks[{ax}]={self.chunks[ax]}; "
+                    "consolidate_chunks cannot shrink chunks"
+                )
+            if target_chunks[ax] % self.chunks[ax] != 0:
+                raise ValueError(
+                    f"target_chunks[{ax}]={target_chunks[ax]} is not a "
+                    f"multiple of current chunks[{ax}]={self.chunks[ax]}"
+                )
+
+        # fast path: already at target
+        if tuple(target_chunks) == self.chunks:
+            return self
+
+        old_chunks = self.chunks
+        new_grid = determine_chunk_grid_shape(self.shape, target_chunks)
+        # ratio: how many sub-chunks per target chunk along each axis
+        ratio = tuple(target_chunks[ax] // old_chunks[ax] for ax in range(self.ndim))
+
+        new_paths = np.full(new_grid, MISSING_CHUNK_PATH, dtype=np.dtypes.StringDType())
+        new_offsets = np.zeros(new_grid, dtype=np.dtype("uint64"))
+        new_lengths = np.zeros(new_grid, dtype=np.dtype("uint64"))
+
+        src_paths = self.manifest._paths
+        src_offsets = self.manifest._offsets
+        src_lengths = self.manifest._lengths
+
+        for new_idx in np.ndindex(*new_grid):
+            # sub-chunk slice in the current grid that maps into this target cell
+            src_slices = tuple(
+                slice(new_idx[ax] * ratio[ax], (new_idx[ax] + 1) * ratio[ax])
+                for ax in range(self.ndim)
+            )
+            sub_paths = src_paths[src_slices]
+            sub_offsets = src_offsets[src_slices]
+            sub_lengths = src_lengths[src_slices]
+
+            # flatten to 1-D for easier scanning
+            flat_paths = sub_paths.ravel()
+            flat_offsets = sub_offsets.ravel().astype(np.int64)
+            flat_lengths = sub_lengths.ravel().astype(np.int64)
+
+            # filter out missing sub-chunks
+            valid_mask = np.array([p != MISSING_CHUNK_PATH for p in flat_paths])
+            if not valid_mask.any():
+                # all missing → emit missing target chunk (already initialised)
+                continue
+
+            valid_paths = flat_paths[valid_mask]
+            valid_offsets = flat_offsets[valid_mask]
+            valid_lengths = flat_lengths[valid_mask]
+
+            # all sub-chunks must point to the same file
+            first_path = valid_paths[0]
+            if not np.all(np.array([p == first_path for p in valid_paths])):
+                raise ValueError(
+                    f"Cannot consolidate target chunk {new_idx}: sub-chunks "
+                    "span more than one source file."
+                )
+
+            # sort by offset so we can check contiguity regardless of array order
+            order = np.argsort(valid_offsets)
+            sorted_offsets = valid_offsets[order]
+            sorted_lengths = valid_lengths[order]
+
+            # check contiguity: each chunk's end == next chunk's start
+            ends = sorted_offsets + sorted_lengths
+            if not np.all(ends[:-1] == sorted_offsets[1:]):
+                raise ValueError(
+                    f"Cannot consolidate target chunk {new_idx}: byte ranges "
+                    "are not contiguous."
+                )
+
+            merged_offset = int(sorted_offsets[0])
+            merged_length = int(ends[-1] - sorted_offsets[0])
+
+            new_paths[new_idx] = first_path
+            new_offsets[new_idx] = np.uint64(merged_offset)
+            new_lengths[new_idx] = np.uint64(merged_length)
+
+        new_manifest = ChunkManifest.from_arrays(
+            paths=new_paths,
+            offsets=new_offsets,
+            lengths=new_lengths,
+            validate_paths=False,
+        )
+        new_meta = copy_and_replace_metadata(
+            self.metadata,
+            new_shape=list(self.shape),
+            new_chunks=list(target_chunks),
+        )
+        return ManifestArray(metadata=new_meta, chunkmanifest=new_manifest)
 
     def to_virtual_variable(self) -> xr.Variable:
         """

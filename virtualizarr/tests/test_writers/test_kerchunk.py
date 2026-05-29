@@ -86,6 +86,14 @@ class TestAccessor:
         )
 
     def test_accessor_to_kerchunk_dict_empty(self, array_v3_metadata):
+        """
+        A manifest with no real chunks (all missing) should still emit inlined
+        fill-value bytes for each chunk key.  This ensures kerchunk parquet can
+        represent missing chunks without storing a None/NaN URL path (which
+        round-trips through pandas as float NaN and crashes fsspec).
+        """
+        import base64
+
         manifest = ChunkManifest(entries={}, shape=(1, 1))
         arr = ManifestArray(
             chunkmanifest=manifest,
@@ -99,22 +107,56 @@ class TestAccessor:
         )
         ds = Dataset({"a": (["x", "y"], arr)})
 
-        expected_ds_refs = {
-            "version": 1,
-            "refs": {
-                ".zgroup": '{"zarr_format":2}',
-                ".zattrs": "{}",
-                "a/.zarray": '{"shape":[2,3],"chunks":[2,3],"fill_value":0,"order":"C","filters":null,"dimension_separator":".","compressor":null,"attributes":{},"zarr_format":2,"dtype":"<i8"}',
-                "a/.zattrs": '{"_ARRAY_DIMENSIONS":["x","y"]}',
-            },
-        }
-
         result_ds_refs = ds.vz.to_kerchunk(format="dict")
-        assert kerchunk_refs_as_json(result_ds_refs) == kerchunk_refs_as_json(
-            expected_ds_refs
-        )
+        refs = result_ds_refs["refs"]
 
-    def test_accessor_to_kerchunk_json(self, tmp_path, array_v3_metadata):
+        # The single chunk key "0.0" must be present and inlined as fill bytes.
+        assert "a/0.0" in refs, "missing chunk must be emitted as inlined fill bytes"
+        val = refs["a/0.0"]
+        assert isinstance(val, str) and val.startswith("base64:"), (
+            f"expected base64-encoded fill bytes, got {val!r}"
+        )
+        # Decode and verify: fill_value=0 for int64, chunk shape (2,3) → 48 bytes
+        raw = base64.b64decode(val[len("base64:"):])
+        assert raw == np.zeros((2, 3), dtype="<i8").tobytes()
+
+    def test_accessor_to_kerchunk_dict_empty_with_filters(self, tmp_path, array_v3_metadata):
+        """
+        Fill-value bytes for missing chunks must be encoded with the array's
+        filters and compressor, so that zarr can decode them.  Previously,
+        _fill_chunk_bytes returned raw uncompressed bytes, causing
+        ``zlib.error: incorrect header check`` when zarr tried to apply the
+        zlib filter on read.
+        """
+        # Build a ManifestArray with shuffle + zlib codecs (mirrors ITS_LIVE HDF5 layout)
+        manifest = ChunkManifest(entries={}, shape=(1, 1))
+        arr = ManifestArray(
+            chunkmanifest=manifest,
+            metadata=array_v3_metadata(
+                shape=(1, 4),
+                data_type=np.dtype("<i2"),
+                chunks=(1, 4),
+                codecs=[
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "numcodecs.shuffle", "configuration": {"elementsize": 2}},
+                    {"name": "numcodecs.zlib", "configuration": {"level": 1}},
+                ],
+                fill_value=-32767,
+            ),
+        )
+        ds = Dataset({"a": (["t", "x"], arr)})
+        path = tmp_path / "filtered.json"
+        ds.vz.to_kerchunk(path, format="json")
+
+        # zarr must be able to open and decode the fill chunk without raising
+        # ``zlib.error: incorrect header check``
+        opened = xr.open_dataset(str(path), engine="kerchunk")
+        values = opened["a"].values  # triggers actual decode
+        assert values.shape == (1, 4)
+        # fill_value=-32767 → xarray masks as NaN (float32)
+        assert np.all(np.isnan(values))
+
+
         import ujson
 
         manifest = ChunkManifest(

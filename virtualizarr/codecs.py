@@ -145,6 +145,16 @@ def get_codec_config(codec: ZarrCodec) -> dict[str, Any]:
         raise ValueError(f"Unable to parse codec configuration: {codec}")
 
 
+def is_uncompressed(array: Union["ManifestArray", "zarr.Array"]) -> bool:
+    """Return True iff the codec pipeline has no compression (BytesCodec only).
+
+    Safe to call before ``_remap_chunks``: byte-splitting is only valid when
+    the stored bytes are raw, uncompressed element data.
+    """
+    _, _, bytesbytes_codecs = extract_codecs(get_codecs(array))
+    return len(bytesbytes_codecs) == 0
+
+
 def get_codecs(array: Union["ManifestArray", "zarr.Array"]) -> CodecPipeline:
     """
     Get the zarr v3 codec pipeline for either a ManifestArray or a Zarr Array.

@@ -468,8 +468,24 @@ class TestConcat:
         assert codec_dict["configuration"] == {"level": 1}
         assert result.metadata.fill_value == metadata.fill_value
 
+    def test_concat_preserves_dimension_names(self, array_v3_metadata):
+        chunks = (5, 10)
+        shape = (5, 10)
+        metadata = array_v3_metadata(shape=shape, chunks=chunks, dimension_names=["x", "y"])
+        manifest1 = ChunkManifest(
+            entries={"0.0": {"path": "/foo1.nc", "offset": 0, "length": 200}}
+        )
+        manifest2 = ChunkManifest(
+            entries={"0.0": {"path": "/foo2.nc", "offset": 0, "length": 200}}
+        )
+        marr1 = ManifestArray(metadata=metadata, chunkmanifest=manifest1)
+        marr2 = ManifestArray(metadata=metadata, chunkmanifest=manifest2)
 
-class TestConcatInlined:
+        result = np.concatenate([marr1, marr2], axis=0)
+        assert result.metadata.dimension_names == ("x", "y")
+
+
+
     def test_concat_two_inlined_along_axis_0(self, array_v3_metadata):
         metadata = array_v3_metadata(shape=(1, 2), chunks=(1, 1))
         marr1 = ManifestArray(
@@ -785,6 +801,157 @@ class TestWithFillValueOnly:
         # where NaN becomes the JSON string "NaN"
         assert result.metadata.to_dict() == marr.metadata.to_dict()
         assert result.manifest.dict() == {}
+
+class TestPadToShape:
+    def test_expands_manifest_grid_new_cells_missing(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(1, 2), chunks=(1, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 8},
+                },
+            ),
+        )
+
+        result = marr.pad_to_shape((1, 3), policy="round_to_chunks")
+
+        assert result.shape == (1, 4)
+        assert result.chunks == (1, 2)
+        assert result.dtype == np.dtype("float32")
+        assert result.manifest.shape_chunk_grid == (1, 2)
+        assert result.manifest.get_entry((0, 0)) is not None
+        assert result.manifest.get_entry((0, 1)) is None
+
+    def test_no_manifest_reallocation_same_grid(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(1, 3), chunks=(1, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 8},
+                    "0.1": {"path": "/foo.nc", "offset": 8, "length": 4},
+                },
+            ),
+        )
+
+        result = marr.pad_to_shape((1, 4), policy="round_to_chunks")
+
+        assert result.shape == (1, 4)
+        assert result.chunks == (1, 2)
+        assert result.manifest.shape_chunk_grid == (1, 2)
+
+    def test_noop_when_shape_unchanged(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(2, 2), chunks=(2, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 16},
+                },
+            ),
+        )
+
+        result = marr.pad_to_shape((2, 2))
+
+        assert result.shape == (2, 2)
+        assert result.manifest.shape_chunk_grid == (1, 1)
+        assert result.manifest.get_entry((0, 0)) is not None
+
+    def test_raises_when_shrinking(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(2, 2), chunks=(2, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 16},
+                },
+            ),
+        )
+
+        with pytest.raises(ValueError, match="only padding"):
+            marr.pad_to_shape((1, 2))
+
+    def test_raises_ndim_mismatch(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(2, 2), chunks=(2, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 16},
+                },
+            ),
+        )
+
+        with pytest.raises(ValueError, match="must match ndim"):
+            marr.pad_to_shape((1, 2, 3))
+
+    def test_round_to_chunks_rounds_up(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(1, 3), chunks=(1, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 8},
+                    "0.1": {"path": "/foo.nc", "offset": 8, "length": 4},
+                },
+            ),
+        )
+
+        with pytest.warns(UserWarning, match="pad_to_shape rounded"):
+            result = marr.pad_to_shape((1, 5))
+
+        assert result.shape == (1, 6)
+
+    def test_error_policy_raises_non_aligned(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(1, 3), chunks=(1, 2), data_type=np.dtype("float32")
+        )
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0.0": {"path": "/foo.nc", "offset": 0, "length": 8},
+                    "0.1": {"path": "/foo.nc", "offset": 8, "length": 4},
+                },
+            ),
+        )
+
+        with pytest.raises(ValueError, match="not a multiple"):
+            marr.pad_to_shape((1, 5), policy="error")
+
+    def test_preserves_inlined_chunks(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(1,), chunks=(1,), data_type=np.dtype("float32")
+        )
+        payload = b"x" * 16
+        marr = ManifestArray(
+            metadata=metadata,
+            chunkmanifest=ChunkManifest(
+                entries={
+                    "0": {"path": "", "offset": 0, "length": 16, "data": payload},
+                },
+            ),
+        )
+
+        result = marr.pad_to_shape((3,))
+
+        assert result.shape == (3,)
+        assert result.manifest._inlined[(0,)] is payload
+        assert result.manifest.get_entry((1,)) is None
+        assert result.manifest.get_entry((2,)) is None
 
 
 def test_refuse_combine(array_v3_metadata):
@@ -1245,6 +1412,307 @@ def test_to_xarray(array_v3_metadata):
     assert vv.data.metadata.dimension_names is None
     assert vv.attrs == {"ham": "sandwich"}
     assert vv.data.metadata.attributes == {}
+
+
+class TestPlaceInGrid:
+    """Tests for ManifestArray.place_in_grid.
+
+    place_in_grid(new_shape, offset) places the existing chunk grid at *offset*
+    inside a larger *new_shape* grid, filling everything else with missing chunks.
+    offset=(0,0,...) is equivalent to pad_to_shape.
+    """
+
+    def _make_2d(self, array_v3_metadata, shape, chunks, path="s3://b/f.nc"):
+        """Helper: make a simple 2D ManifestArray with one chunk per grid cell."""
+        from virtualizarr.utils import determine_chunk_grid_shape
+
+        grid = determine_chunk_grid_shape(shape, chunks)
+        entries = {}
+        offset = 0
+        length = int(np.prod(chunks)) * 4  # float32
+        for idx in np.ndindex(*grid):
+            key = ".".join(str(i) for i in idx)
+            entries[key] = {"path": path, "offset": offset, "length": length}
+            offset += length
+        metadata = array_v3_metadata(shape=shape, chunks=chunks)
+        return ManifestArray(metadata=metadata, chunkmanifest=ChunkManifest(entries=entries))
+
+    def test_offset_zero_equals_pad_to_shape(self, array_v3_metadata):
+        """place_in_grid with zero offset is identical to pad_to_shape."""
+        ma = self._make_2d(array_v3_metadata, shape=(4, 6), chunks=(2, 2))
+        new_shape = (6, 8)
+        result_place = ma.place_in_grid(new_shape, offset=(0, 0))
+        result_pad = ma.pad_to_shape(new_shape)
+        assert result_place.shape == result_pad.shape
+        assert result_place.chunks == result_pad.chunks
+        assert result_place.manifest.dict() == result_pad.manifest.dict()
+
+    def test_places_data_at_correct_chunk_index(self, array_v3_metadata):
+        """Data appears at the right chunk position in the new grid."""
+        # 1×2 array with chunk (1,1), placed at offset (0,2) in a (1,4) grid
+        ma = self._make_2d(array_v3_metadata, shape=(1, 2), chunks=(1, 1))
+        result = ma.place_in_grid(new_shape=(1, 4), offset=(0, 2))
+        assert result.shape == (1, 4)
+        d = result.manifest.dict()
+        # original chunks should be at column indices 2 and 3
+        assert "0.2" in d
+        assert "0.3" in d
+        # columns 0 and 1 should be missing (not in dict)
+        assert "0.0" not in d
+        assert "0.1" not in d
+
+    def test_offset_on_both_axes(self, array_v3_metadata):
+        """Offset on both axes places the chunk block at the correct corner."""
+        ma = self._make_2d(array_v3_metadata, shape=(2, 2), chunks=(1, 1))
+        result = ma.place_in_grid(new_shape=(4, 4), offset=(2, 2))
+        d = result.manifest.dict()
+        # original 2×2 block should appear at chunk indices (2,2),(2,3),(3,2),(3,3)
+        for r in (2, 3):
+            for c in (2, 3):
+                assert f"{r}.{c}" in d
+        # everything else is missing
+        for r in (0, 1):
+            for c in range(4):
+                assert f"{r}.{c}" not in d
+
+    def test_non_chunk_aligned_offset_raises_with_policy_error(self, array_v3_metadata):
+        """Non-chunk-aligned offset raises ValueError when policy='error'."""
+        ma = self._make_2d(array_v3_metadata, shape=(2, 4), chunks=(2, 2))
+        with pytest.raises(ValueError, match="chunk-aligned"):
+            ma.place_in_grid(new_shape=(4, 8), offset=(0, 1), policy="error")
+
+    def test_non_chunk_aligned_offset_rounds_with_warning(self, array_v3_metadata):
+        """Non-chunk-aligned offset is rounded up with a warning when policy='round_to_chunks'."""
+        import warnings
+        ma = self._make_2d(array_v3_metadata, shape=(1, 2), chunks=(1, 2))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = ma.place_in_grid(new_shape=(1, 6), offset=(0, 1))
+        assert any("rounded" in str(warning.message).lower() for warning in w)
+        # offset 1 rounded to 2 (next multiple of chunk size 2)
+        assert result.shape[1] >= 4  # shape must fit rounded offset + original size
+
+    def test_new_shape_too_small_raises(self, array_v3_metadata):
+        """Raises if new_shape cannot fit the array at the given offset."""
+        ma = self._make_2d(array_v3_metadata, shape=(2, 4), chunks=(2, 2))
+        with pytest.raises(ValueError, match="too small"):
+            ma.place_in_grid(new_shape=(2, 4), offset=(0, 2))
+
+    def test_shrinking_raises(self, array_v3_metadata):
+        """new_shape smaller than self.shape raises even with zero offset."""
+        ma = self._make_2d(array_v3_metadata, shape=(4, 4), chunks=(2, 2))
+        with pytest.raises(ValueError):
+            ma.place_in_grid(new_shape=(2, 4), offset=(0, 0))
+
+    def test_preserves_chunk_references(self, array_v3_metadata):
+        """Existing chunk paths/offsets/lengths are preserved after placement."""
+        ma = self._make_2d(array_v3_metadata, shape=(1, 1), chunks=(1, 1))
+        original_entry = list(ma.manifest.dict().values())[0]
+        result = ma.place_in_grid(new_shape=(2, 2), offset=(1, 1))
+        d = result.manifest.dict()
+        assert "1.1" in d
+        placed_entry = d["1.1"]
+        assert placed_entry["path"] == original_entry["path"]
+        assert placed_entry["offset"] == original_entry["offset"]
+        assert placed_entry["length"] == original_entry["length"]
+
+
+class TestIsUncompressed:
+    def test_uncompressed_array(self, array_v3_metadata):
+        from virtualizarr.codecs import is_uncompressed
+
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 8, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        assert is_uncompressed(marr) is True
+
+    def test_compressed_array(self, array_v3_metadata):
+        from virtualizarr.codecs import is_uncompressed
+
+        metadata = array_v3_metadata(
+            shape=(4,), chunks=(2,), codecs=[ARRAYBYTES_CODEC, ZLIB_CODEC]
+        )
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 8, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        assert is_uncompressed(marr) is False
+
+
+class TestRemapChunks:
+    def test_remap_raises_on_compressed(self, array_v3_metadata):
+        metadata = array_v3_metadata(
+            shape=(4,), chunks=(4,), codecs=[ARRAYBYTES_CODEC, ZLIB_CODEC]
+        )
+        manifest = ChunkManifest(
+            entries={"0": {"path": "s3://b/f.nc", "offset": 0, "length": 16}}
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        with pytest.raises(ValueError, match="compressed"):
+            marr._remap_chunks((1,))
+
+    def test_remap_uncompressed_works(self, array_v3_metadata):
+        # 4-element contiguous array, remap to chunk_size=2
+        metadata = array_v3_metadata(shape=(4,), chunks=(4,))
+        manifest = ChunkManifest(
+            entries={"0": {"path": "s3://b/f.nc", "offset": 0, "length": 16}}
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        remapped = marr._remap_chunks((2,))
+        assert remapped.chunks == (2,)
+        assert remapped.shape == (4,)
+
+
+class TestConsolidateChunks:
+    """Tests for ManifestArray.consolidate_chunks."""
+
+    def test_fast_path_same_chunks(self, array_v3_metadata):
+        """consolidate_chunks with identical target returns self."""
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 8, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        result = marr.consolidate_chunks((2,))
+        assert result is marr
+
+    def test_merge_two_sub_chunks_into_one(self, array_v3_metadata):
+        """Two contiguous sub-chunks merge into a single manifest entry."""
+        # 4-element array, currently chunk_size=2; merge to chunk_size=4
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 10, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 18, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        result = marr.consolidate_chunks((4,))
+        assert result.chunks == (4,)
+        assert result.shape == (4,)
+        entry = result.manifest.get_entry((0,))
+        assert entry is not None
+        assert entry["path"] == "s3://b/f.nc"
+        assert entry["offset"] == 10
+        assert entry["length"] == 16
+
+    def test_missing_sub_chunks_stay_missing(self, array_v3_metadata):
+        """A target chunk composed entirely of missing sub-chunks stays missing."""
+        metadata = array_v3_metadata(shape=(4,), chunks=(1,))
+        # only first two elements have data; last two are missing
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 4},
+                "1": {"path": "s3://b/f.nc", "offset": 4, "length": 4},
+            },
+            shape=(4,),
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        result = marr.consolidate_chunks((2,))
+        assert result.chunks == (2,)
+        entry0 = result.manifest.get_entry((0,))
+        assert entry0 is not None
+        assert entry0["length"] == 8
+        entry1 = result.manifest.get_entry((1,))
+        assert entry1 is None
+
+    def test_cross_file_raises(self, array_v3_metadata):
+        """Sub-chunks pointing to different files raise ValueError."""
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f1.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f2.nc", "offset": 8, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        with pytest.raises(ValueError, match="more than one source file"):
+            marr.consolidate_chunks((4,))
+
+    def test_non_contiguous_raises(self, array_v3_metadata):
+        """Sub-chunks with a gap in byte ranges raise ValueError."""
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 100, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        with pytest.raises(ValueError, match="not contiguous"):
+            marr.consolidate_chunks((4,))
+
+    def test_roundtrip_remap_then_consolidate(self, array_v3_metadata):
+        """_remap_chunks followed by consolidate_chunks returns original byte ranges."""
+        # 8-element array in one chunk
+        metadata = array_v3_metadata(shape=(8,), chunks=(8,))
+        manifest = ChunkManifest(
+            entries={"0": {"path": "s3://b/f.nc", "offset": 100, "length": 32}}
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        remapped = marr._remap_chunks((2,))
+        assert remapped.chunks == (2,)
+        consolidated = remapped.consolidate_chunks((8,))
+        assert consolidated.chunks == (8,)
+        entry = consolidated.manifest.get_entry((0,))
+        assert entry is not None
+        assert entry["path"] == "s3://b/f.nc"
+        assert entry["offset"] == 100
+        assert entry["length"] == 32
+
+    def test_2d_merge(self, array_v3_metadata):
+        """2-D: remap (4,4) chunk to (1,1), consolidate back to (4,4)."""
+        # Use int16 (2 bytes): 4×4 = 16 elements × 2 bytes = 32 bytes total
+        metadata = array_v3_metadata(shape=(4, 4), chunks=(4, 4), data_type=np.dtype("int16"))
+        manifest = ChunkManifest(
+            entries={"0.0": {"path": "s3://b/f.nc", "offset": 0, "length": 32}}
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        remapped = marr._remap_chunks((1, 1))
+        assert remapped.manifest.shape_chunk_grid == (4, 4)
+        consolidated = remapped.consolidate_chunks((4, 4))
+        assert consolidated.chunks == (4, 4)
+        entry = consolidated.manifest.get_entry((0, 0))
+        assert entry is not None
+        assert entry["offset"] == 0
+        assert entry["length"] == 32
+
+    def test_invalid_target_smaller_raises(self, array_v3_metadata):
+        metadata = array_v3_metadata(shape=(4,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 8, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        with pytest.raises(ValueError, match="cannot shrink"):
+            marr.consolidate_chunks((1,))
+
+    def test_invalid_target_not_multiple_raises(self, array_v3_metadata):
+        # current chunks=(2,), target=(3,): 3 is not a multiple of 2
+        metadata = array_v3_metadata(shape=(6,), chunks=(2,))
+        manifest = ChunkManifest(
+            entries={
+                "0": {"path": "s3://b/f.nc", "offset": 0, "length": 8},
+                "1": {"path": "s3://b/f.nc", "offset": 8, "length": 8},
+                "2": {"path": "s3://b/f.nc", "offset": 16, "length": 8},
+            }
+        )
+        marr = ManifestArray(metadata=metadata, chunkmanifest=manifest)
+        with pytest.raises(ValueError, match="not a multiple"):
+            marr.consolidate_chunks((3,))
 
 
 def test_to_virtual_variable_preserves_inlined(array_v3_metadata):
