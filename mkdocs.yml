@@ -25,6 +25,7 @@ nav:
     - "custom_parsers.md"
     - "scaling.md"
     - "faq.md"
+    - "design/mosaic-and-padding.md"
   - API Reference:
     - api/virtualizarr.md
     - Parsers:
