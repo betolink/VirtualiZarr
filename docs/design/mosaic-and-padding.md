@@ -345,7 +345,33 @@ Consolidation is skipped for compressed arrays (already handled by `pad_to_shape
 and for chunk groups that span multiple source files (cross-granule merges are
 correctly rejected by `consolidate_chunks`).
 
-To disable:
+#### Limitation: ragged uncompressed granules
+
+When granules have **different** row counts (e.g. TEMPO G01=132, G02=131),
+padding fills G02 to 132 rows with a missing sub-chunk.  After concat the target
+cell for G02 contains **131 real + 1 missing** sub-chunks.  Merging these would
+produce a manifest entry claiming `(132, xtrack)` bytes but storing only
+`131 × xtrack` bytes, causing a zarr reshape error at read time:
+
+```
+ValueError: cannot reshape array of size 268288 into shape (1,132,2048)
+```
+
+`consolidate_chunks` detects this mixed-presence cell and raises `ValueError`;
+`_consolidate_dataset` catches it and leaves the variable at `chunk_size=1`.
+The result is **correct and safe** — just without the task-count reduction:
+
+```
+TEMPO example (G01=132, G02=131 rows, ragged):
+
+  consolidate=True (safe no-op):  264 chunks × (1, 2048)  — reads correctly
+  consolidate=False:              264 chunks × (1, 2048)  — same
+```
+
+Consolidation *does* help when all granules in a scan have the same row count
+(uniform, non-ragged) or when HDF5 files use explicit chunk storage.
+
+To disable explicitly:
 
 ```python
 vds = open_virtual_mfdataset(..., consolidate=False)

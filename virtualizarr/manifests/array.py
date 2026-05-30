@@ -668,6 +668,18 @@ class ManifestArray:
                 # all missing → emit missing target chunk (already initialised)
                 continue
 
+            if not valid_mask.all():
+                # mixed real+missing: the real sub-chunks cover fewer bytes than
+                # the declared target chunk shape requires.  Merging them would
+                # produce a manifest entry whose byte length is smaller than
+                # shape × itemsize, causing a reshape error at read time for
+                # uncompressed arrays.  Raise so the caller can skip this variable.
+                raise ValueError(
+                    f"Cannot consolidate target chunk {new_idx}: cell contains "
+                    "a mix of real and missing sub-chunks.  The real bytes would "
+                    "not fill the declared target chunk shape."
+                )
+
             valid_paths = flat_paths[valid_mask]
             valid_offsets = flat_offsets[valid_mask]
             valid_lengths = flat_lengths[valid_mask]

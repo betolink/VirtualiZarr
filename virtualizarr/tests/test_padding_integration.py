@@ -311,10 +311,21 @@ class TestTEMPOIssue487:
         assert result["vertical_column_troposphere"] is not None
         assert result["vertical_column_troposphere"].shape == (2, 264, 2048)
 
-    def test_consolidate_default_true_reduces_chunk_count(self, tempo_urls, registry):
-        """consolidate=True (default) merges size-1 padding chunks back to
-        natural granule-sized chunks along mirror_step, dramatically reducing
-        the number of chunks in the combined manifest."""
+    def test_consolidate_noop_for_ragged_uncompressed(self, tempo_urls, registry):
+        """consolidate=True is a safe no-op when ragged granules produce mixed
+        real+missing sub-chunks in a target cell.
+
+        The TEMPO fixtures have granules of 132 and 131 rows.  After padding to
+        132 and concat to 264, the target chunk (132, 2048) produces:
+          - cell 0: G01 (132 real rows) → consolidatable ✓
+          - cell 1: G02 (131 real + 1 missing) → mixed → ValueError → skip ✗
+
+        Because consolidation requires a uniform chunk size, the whole variable
+        stays at chunk_size=1.  This is correct and safe — no data corruption.
+        The alternative (merging 131 real bytes into a 132-row chunk declaration)
+        causes zarr to raise "cannot reshape array of size 268288 into shape
+        (1,132,2048)" at read time.
+        """
         scan3 = [tempo_urls[0], tempo_urls[1]]
         scan4 = [tempo_urls[2], tempo_urls[3]]
         urls = [scan3, scan4]
@@ -334,18 +345,16 @@ class TestTEMPOIssue487:
         no2 = result["vertical_column_troposphere"]
         assert no2.shape == (2, 264, 2048)
 
-        # With chunk_size=1 (no consolidation) there would be 2*264 = 528 chunks
-        # along (datescan, mirror_step). After consolidation chunks along
-        # mirror_step should be much larger than 1.
+        # Mixed real+missing cells → consolidation skipped → stays at chunk_size=1.
+        # This is correct; consolidating would produce a partial-byte chunk that
+        # zarr cannot decode.
         ma = no2.data
-        assert ma.chunks[1] > 1, (
-            f"Expected mirror_step chunk size > 1 after consolidation, got {ma.chunks}"
+        assert ma.chunks[1] == 1, (
+            f"Expected chunk_size=1 (safe no-op for ragged), got {ma.chunks}"
         )
 
     def test_consolidate_false_preserves_size1_chunks(self, tempo_urls, registry):
-        """consolidate=False leaves the chunk_size=1 structure produced by
-        padding intact — useful for debugging or when callers consolidate
-        manually."""
+        """consolidate=False explicitly preserves the chunk_size=1 structure."""
         scan3 = [tempo_urls[0], tempo_urls[1]]
         scan4 = [tempo_urls[2], tempo_urls[3]]
         urls = [scan3, scan4]
@@ -365,7 +374,6 @@ class TestTEMPOIssue487:
         no2 = result["vertical_column_troposphere"]
         assert no2.shape == (2, 264, 2048)
         ma = no2.data
-        # Padding remaps to chunk_size=1 along mirror_step
         assert ma.chunks[1] == 1, (
             f"Expected mirror_step chunk size == 1 with consolidate=False, got {ma.chunks}"
         )
