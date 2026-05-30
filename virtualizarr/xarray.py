@@ -693,6 +693,57 @@ def _compute_common_chunks(
     return common
 
 
+def _consolidate_dataset(
+    ds: xr.Dataset,
+    original_chunks: dict[str, tuple[int, ...]],
+) -> xr.Dataset:
+    """Consolidate ManifestArray variables back to pre-padding chunk sizes.
+
+    After padding + concat, uncompressed variables on padded dims end up with
+    chunk_size=1 everywhere.  This function tries to merge those size-1 chunks
+    back to the original (per-granule) chunk sizes recorded before padding.
+    Sub-chunks that are contiguous and from the same source file are merged;
+    cells where every sub-chunk is missing are kept as missing.  Variables
+    that cannot be consolidated (e.g. different-file sub-chunks across
+    granule boundaries) are left unchanged.
+    """
+    new_vars: dict[str, xr.Variable] = {}
+    for _name, var in ds.variables.items():
+        name = cast(str, _name)
+        if _is_virtual_variable(var) and name in original_chunks:
+            ma: ManifestArray = var.data
+            target = original_chunks[name]
+            if target != ma.chunks:
+                try:
+                    ma = ma.consolidate_chunks(target)
+                    var = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
+                except (ValueError, NotImplementedError):
+                    pass  # leave unchanged if not consolidatable
+        new_vars[name] = var
+
+    return construct_fully_virtual_dataset(new_vars, attrs=ds.attrs)
+
+
+def _original_chunks_from_datasets(
+    datasets: list[xr.Dataset],
+) -> dict[str, tuple[int, ...]]:
+    """Record the natural chunk sizes per variable from a list of datasets,
+    taking the maximum along each axis (largest natural chunk wins)."""
+    result: dict[str, tuple[int, ...]] = {}
+    for ds in datasets:
+        for _name, var in ds.variables.items():
+            name = cast(str, _name)
+            if _is_virtual_variable(var):
+                ma: ManifestArray = var.data
+                if name not in result:
+                    result[name] = ma.chunks
+                else:
+                    result[name] = tuple(
+                        max(a, b) for a, b in zip(result[name], ma.chunks)
+                    )
+    return result
+
+
 def _emit_pad_warning(report: dict[str, int], stage: str = "") -> None:
     """Emit a single warning summarizing padding actions."""
     if not report:
@@ -757,13 +808,30 @@ def _nested_combine_with_padding(
     pad_scope: set[str] | None,
     explicit_targets: dict[str, int],
     pad_warn: bool,
+    consolidate: bool = True,
 ) -> xr.Dataset:
-    parts = list(datasets)
-    total_report: dict[str, int] = {}
-    step_ids: list = list(ids)
+    """Combine datasets with padding, processing from innermost to outermost dim.
 
-    def _pad_and_normalize(parts_list: list[xr.Dataset], dim: str) -> list[xr.Dataset]:
-        """Apply padding + chunk normalisation + coord normalisation."""
+    ``concat_dims[0]`` is the outermost dimension (top-level list in the
+    nested structure); ``concat_dims[-1]`` is the innermost.  IDs are tuples
+    where ``id[0]`` is the outer index and ``id[-1]`` is the inner index.
+
+    We process innermost first so that padding is applied within each inner
+    group independently.  This is the correct behaviour for TEMPO-like data
+    where only the innermost concat dimension (``mirror_step``) is ragged.
+    """
+    total_report: dict[str, int] = {}
+
+    # Map each dataset to its id tuple (normalised to a tuple of ints).
+    indexed: list[tuple[tuple[int, ...], xr.Dataset]] = []
+    for sid, ds in zip(ids, datasets):
+        key = tuple(sid) if isinstance(sid, (tuple, list)) else (int(sid),)
+        indexed.append((key, ds))
+
+    def _pad_and_normalize(
+        parts_list: list[xr.Dataset], dim: str
+    ) -> list[xr.Dataset]:
+        """Pad within a group + normalise coords for the upcoming concat."""
         auto = _compute_pad_targets(parts_list, pad_scope)
         targets = {**auto, **explicit_targets}
         chunk_map = _compute_common_chunks(parts_list, pad_dims=set(targets.keys()))
@@ -776,32 +844,68 @@ def _nested_combine_with_padding(
             parts_list = padded
         return _normalize_coords_for_concat(parts_list, dim)
 
-    for level, dim in enumerate(concat_dims):
-        if len(parts) == 1:
-            break
+    # Process from innermost dimension to outermost.
+    # At each step: group by the outer prefix (all but the last key element),
+    # pad within each group, concat along the current (innermost remaining) dim.
+    ndims = len(concat_dims)
 
-        parts = _pad_and_normalize(parts, dim)
+    for step in range(ndims - 1, -1, -1):
+        # dim for this step is concat_dims[step] (innermost not-yet-reduced)
+        dim = concat_dims[step]
 
-        if level < len(concat_dims) - 1 and step_ids and len(step_ids[0]) > 1:
-            depth = level + 1
-            groups: dict[tuple, list[int]] = {}
-            for i, sid in enumerate(step_ids):
-                sid_t = tuple(sid) if isinstance(sid, tuple) else (sid,)
-                groups.setdefault(sid_t[:depth], []).append(i)
-            next_parts, next_ids = [], []
-            for prefix, indices in groups.items():
-                next_parts.append(xr.concat([parts[i] for i in indices], dim=dim))
-                next_ids.append(prefix)
-            parts, step_ids = next_parts, next_ids
-        else:
-            parts = [xr.concat(parts, dim=dim)]
+        # Group by the outer-prefix portion of the id (everything before index `step`).
+        groups: dict[tuple[int, ...], list[tuple[tuple[int, ...], xr.Dataset]]] = {}
+        for key, ds in indexed:
+            prefix = key[:step]  # outer indices (empty tuple for outermost step)
+            groups.setdefault(prefix, []).append((key, ds))
 
-        # After concat shapes may have changed; re-apply padding if needed.
-        parts = _pad_and_normalize(parts, dim)
+        next_indexed: list[tuple[tuple[int, ...], xr.Dataset]] = []
+        for prefix, group_items in groups.items():
+            group_ds = [ds for _, ds in group_items]
+
+            if len(group_ds) == 1:
+                # Nothing to concat at this level; just carry forward.
+                next_indexed.append((prefix, group_ds[0]))
+                continue
+
+            # Record natural chunk sizes BEFORE padding remaps to chunk_size=1
+            original_chunks = _original_chunks_from_datasets(group_ds) if consolidate else {}
+
+            padded_group = _pad_and_normalize(group_ds, dim)
+            combined = xr.concat(
+                padded_group,
+                dim=dim,
+                join="override",
+                compat="override",
+                coords="minimal",
+                data_vars="all",
+                combine_attrs="override",
+            )
+
+            if consolidate:
+                # Target = original per-granule chunk size (NOT scaled by n).
+                # After concat, the manifest has n*orig_rows chunks of size 1
+                # along the concat dim. Each granule's rows are contiguous and
+                # from the same source file, so consolidating to orig_rows merges
+                # them cleanly. Consolidating across granule boundaries would
+                # span multiple source files and correctly raise ValueError.
+                target_chunks: dict[str, tuple[int, ...]] = {}
+                for name, chunks in original_chunks.items():
+                    var = combined.variables.get(name)
+                    if var is None:
+                        continue
+                    target_chunks[name] = chunks  # keep original, don't multiply
+                combined = _consolidate_dataset(combined, target_chunks)
+
+            next_indexed.append((prefix, combined))
+
+        indexed = next_indexed
 
     if pad_warn:
         _emit_pad_warning(total_report)
-    return parts[0]
+
+    assert len(indexed) == 1, f"Expected 1 dataset after all concat steps, got {len(indexed)}"
+    return indexed[0][1]
 
 
 def open_virtual_mfdataset(
@@ -835,6 +939,7 @@ def open_virtual_mfdataset(
     pad_policy: Literal["round_to_chunks", "error"] = "round_to_chunks",
     pad_warn: bool = True,
     mosaic_dims: "list[str] | None" = None,
+    consolidate: bool = True,
     **kwargs,
 ) -> Dataset:
     """
@@ -974,6 +1079,7 @@ def open_virtual_mfdataset(
                 pad_scope=pad_scope,
                 explicit_targets=explicit_targets,
                 pad_warn=pad_warn,
+                consolidate=consolidate,
             )
             return staged
 

@@ -107,6 +107,176 @@ class TestPadNested:
         assert result["a"].shape == (3, 3)
 
 
+def _create_tempo_like_granule(tmp_path, name, mirror_step_size, xtrack_size=8, scan_id=0, granule_id=0):
+    """Create a synthetic HDF5 file mimicking a TEMPO L2 granule.
+
+    Layout:
+    - dims: (mirror_step, xtrack) — uses dimension scales named mirror_step and xtrack
+    - ``time``   : float64 1-D on mirror_step (one timestamp per scanline, NOT a dim coord)
+    - ``lat``    : float32 2-D (mirror_step, xtrack)
+    - ``lon``    : float32 2-D (mirror_step, xtrack)
+    - ``no2``    : float32 2-D data variable (mirror_step, xtrack)
+    """
+    import h5py
+
+    path = tmp_path / name
+    with h5py.File(path, "w") as f:
+        ms = mirror_step_size
+        xt = xtrack_size
+
+        # dimension scales — named mirror_step and xtrack to match TEMPO
+        mirror_idx = np.arange(ms, dtype="float64")
+        xtrack_idx = np.arange(xt, dtype="float64")
+        f.create_dataset("mirror_step", data=mirror_idx)
+        f.create_dataset("xtrack", data=xtrack_idx)
+        f["mirror_step"].make_scale("mirror_step")
+        f["xtrack"].make_scale("xtrack")
+
+        # time: 1D variable along mirror_step (NOT a dimension scale)
+        f.create_dataset(
+            "time",
+            data=np.arange(ms, dtype="float64") + scan_id * 1000 + granule_id * ms,
+        )
+        f["time"].dims[0].attach_scale(f["mirror_step"])
+
+        # 2D variables
+        for var_name, dtype, val in [
+            ("lat", "float32", float(scan_id + granule_id * 0.1)),
+            ("lon", "float32", float(granule_id + scan_id * 10)),
+            ("no2", "float32", float(scan_id * 10 + granule_id)),
+        ]:
+            f.create_dataset(var_name, data=np.full((ms, xt), val, dtype=dtype))
+            f[var_name].dims[0].attach_scale(f["mirror_step"])
+            f[var_name].dims[1].attach_scale(f["xtrack"])
+
+    return f"file://{path.resolve()}"
+
+
+class TestTEMPOSyntheticIssue487:
+    """Synthetic test for the two-level nested concat: outer=datescan, inner=mirror_step.
+
+    Mirrors issue #487: TEMPO L2 granules have (mirror_step, xtrack) dims.
+    The last granule in each scan may have fewer mirror_step rows (ragged).
+    Padding must only happen at the inner mirror_step level, not at the outer
+    datescan level.
+    """
+
+    XTRACK = 8
+    # scan1: [10, 10, 7] mirror_step sizes (last granule ragged)
+    # scan2: [10, 10, 8] mirror_step sizes (last granule ragged)
+    SCAN1_SIZES = [10, 10, 7]
+    SCAN2_SIZES = [10, 10, 8]
+
+    @pytest.fixture
+    def registry(self):
+        return ObjectStoreRegistry({"file://": LocalStore()})
+
+    @pytest.fixture
+    def scan_urls(self, tmp_path):
+        scan1 = [
+            _create_tempo_like_granule(tmp_path, f"s1g{i}.h5", ms, self.XTRACK, scan_id=0, granule_id=i)
+            for i, ms in enumerate(self.SCAN1_SIZES)
+        ]
+        scan2 = [
+            _create_tempo_like_granule(tmp_path, f"s2g{i}.h5", ms, self.XTRACK, scan_id=1, granule_id=i)
+            for i, ms in enumerate(self.SCAN2_SIZES)
+        ]
+        return [scan1, scan2]
+
+    def _add_datescan(self, ds):
+        """Preprocess: add synthetic datescan scalar coord."""
+        source = ds.encoding.get("source", "")
+        m = re.search(r"s(\d+)g", source)
+        scan_id = int(m.group(1)) if m else 0
+        return ds.expand_dims("datescan").assign_coords(datescan=[f"scan_{scan_id:03d}"])
+
+    def test_two_level_nested_concat_shape(self, scan_urls, registry):
+        """Concat_dim=['datescan','mirror_step']: outer=datescan, inner=mirror_step.
+
+        Padding must pad mirror_step within each scan to max(scan_sizes),
+        then outer concat along datescan. Final shape: (2, 30, 8).
+        """
+        result = open_virtual_mfdataset(
+            scan_urls,
+            registry=registry,
+            parser=HDFParser(),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=[],
+        )
+
+        # mirror_step per scan: max(10,10,7)=10, max(10,10,8)=10 → total=20 after outer concat
+        # datescan=2, mirror_step=20 (inner concat of 3 granules with padding), xtrack=8
+        # Wait: inner concat along mirror_step: 10+10+10=30, outer concat along datescan: 2
+        # shape = (datescan=2, mirror_step=30, xtrack=8)
+        assert result["no2"].dims == ("datescan", "mirror_step", "xtrack")
+        assert result["no2"].shape == (2, 30, self.XTRACK)
+
+    def test_padding_only_on_mirror_step_not_outer_dim(self, scan_urls, registry):
+        """Verify padding is applied only to mirror_step (ragged dim), not datescan."""
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            result = open_virtual_mfdataset(
+                scan_urls,
+                registry=registry,
+                parser=HDFParser(),
+                combine="nested",
+                concat_dim=["datescan", "mirror_step"],
+                pad="auto",
+                preprocess=self._add_datescan,
+                loadable_variables=[],
+            )
+
+        pad_warnings = [w for w in record if "padding" in str(w.message).lower()]
+        # At least one warning about mirror_step padding
+        if pad_warnings:
+            warning_text = " ".join(str(w.message) for w in pad_warnings)
+            assert "mirror_step" in warning_text
+            # datescan should NOT appear in padding warnings (it's not ragged)
+            assert "datescan" not in warning_text
+
+        # Shape is correct regardless of warnings
+        assert result["no2"].shape == (2, 30, self.XTRACK)
+
+    def test_time_variable_concatenates_naturally(self, scan_urls, registry):
+        """time is a 1D variable on mirror_step; it must concat naturally (not conflict)."""
+        result = open_virtual_mfdataset(
+            scan_urls,
+            registry=registry,
+            parser=HDFParser(),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=["xtrack"],
+        )
+        # time is along mirror_step so after inner concat its size = 30 per scan
+        # after outer concat it should be (datescan=2, mirror_step=30)
+        assert "time" in result
+        # xtrack is a 1D coordinate
+        assert "xtrack" in result.coords
+        assert result["xtrack"].shape == (self.XTRACK,)
+
+    def test_lat_lon_present_as_2d_coords(self, scan_urls, registry):
+        """lat and lon are 2D (mirror_step, xtrack) and must be present in the result."""
+        result = open_virtual_mfdataset(
+            scan_urls,
+            registry=registry,
+            parser=HDFParser(),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=[],
+        )
+        assert "lat" in result
+        assert "lon" in result
+        assert result["lat"].dims == ("datescan", "mirror_step", "xtrack")
+        assert result["lon"].dims == ("datescan", "mirror_step", "xtrack")
+
+
 class TestTEMPOIssue487:
     @pytest.fixture
     def tempo_urls(self):
@@ -132,7 +302,7 @@ class TestTEMPOIssue487:
             registry=registry,
             parser=HDFParser(group="/product"),
             combine="nested",
-            concat_dim=["mirror_step", "datescan"],
+            concat_dim=["datescan", "mirror_step"],
             pad="auto",
             preprocess=self._add_datescan,
             loadable_variables=[],
@@ -140,6 +310,65 @@ class TestTEMPOIssue487:
 
         assert result["vertical_column_troposphere"] is not None
         assert result["vertical_column_troposphere"].shape == (2, 264, 2048)
+
+    def test_consolidate_default_true_reduces_chunk_count(self, tempo_urls, registry):
+        """consolidate=True (default) merges size-1 padding chunks back to
+        natural granule-sized chunks along mirror_step, dramatically reducing
+        the number of chunks in the combined manifest."""
+        scan3 = [tempo_urls[0], tempo_urls[1]]
+        scan4 = [tempo_urls[2], tempo_urls[3]]
+        urls = [scan3, scan4]
+
+        result = open_virtual_mfdataset(
+            urls,
+            registry=registry,
+            parser=HDFParser(group="/product"),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=[],
+            consolidate=True,
+        )
+
+        no2 = result["vertical_column_troposphere"]
+        assert no2.shape == (2, 264, 2048)
+
+        # With chunk_size=1 (no consolidation) there would be 2*264 = 528 chunks
+        # along (datescan, mirror_step). After consolidation chunks along
+        # mirror_step should be much larger than 1.
+        ma = no2.data
+        assert ma.chunks[1] > 1, (
+            f"Expected mirror_step chunk size > 1 after consolidation, got {ma.chunks}"
+        )
+
+    def test_consolidate_false_preserves_size1_chunks(self, tempo_urls, registry):
+        """consolidate=False leaves the chunk_size=1 structure produced by
+        padding intact — useful for debugging or when callers consolidate
+        manually."""
+        scan3 = [tempo_urls[0], tempo_urls[1]]
+        scan4 = [tempo_urls[2], tempo_urls[3]]
+        urls = [scan3, scan4]
+
+        result = open_virtual_mfdataset(
+            urls,
+            registry=registry,
+            parser=HDFParser(group="/product"),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=[],
+            consolidate=False,
+        )
+
+        no2 = result["vertical_column_troposphere"]
+        assert no2.shape == (2, 264, 2048)
+        ma = no2.data
+        # Padding remaps to chunk_size=1 along mirror_step
+        assert ma.chunks[1] == 1, (
+            f"Expected mirror_step chunk size == 1 with consolidate=False, got {ma.chunks}"
+        )
 
 
 class TestPadCompressed:
@@ -385,4 +614,5 @@ class TestITSLiveMosaic:
                 loadable_variables=["x", "y", "time"],
                 mosaic_dims=["y", "x"],
             )
+
 

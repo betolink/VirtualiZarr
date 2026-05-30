@@ -215,6 +215,8 @@ opening each granule and before concatenating along `concat_dim`.
 | `_resolve_pad_scope` / `_collect_explicit_targets` | Helper for `pad=` parameter logic |
 | `_compute_common_chunks` | Finds the common chunk shape across datasets for a variable |
 | `_nested_combine_with_padding` | Wraps `open_virtual_mfdataset` combine path with padding |
+| `_consolidate_dataset` | Merges size-1 padding sub-chunks back to natural granule chunk sizes |
+| `_original_chunks_from_datasets` | Records pre-padding chunk sizes per variable for later consolidation |
 
 #### Bug fix in `_compute_mosaic_plan` (offset sign for decreasing axes)
 
@@ -319,6 +321,34 @@ proxy dimensions:  nx=64, chunk_ny=16, ny ∈ [96, 160]  (1/32 scale of real TEM
 union_ny:          160 (rounded to chunk boundary)
 real chunks:       1437
 fill chunks:        243  (14.5% of grid)
+```
+
+### Chunk consolidation after padding
+
+Padding uncompressed arrays requires `_remap_chunks(1)` to ensure every element
+boundary is chunk-aligned, producing `chunk_size=1` along the padded dimension.
+After `xr.concat`, the combined manifest therefore has `N × orig_rows` chunks of
+shape `(1, xtrack)` instead of the natural `orig_rows`-per-granule chunks.
+
+`open_virtual_mfdataset` automatically consolidates these back with
+`consolidate=True` (the default). After consolidation each granule's contiguous
+rows are merged back into one chunk, reducing the task count by `~orig_rows` ×:
+
+```
+TEMPO example (2 granules of 132 rows, padded to 132 each):
+
+  without consolidation:  264 chunks × (1, 2048)   → 22 176 Dask tasks for mean()
+  with consolidation:       4 chunks × (132, 2048)  →    168 Dask tasks for mean()
+```
+
+Consolidation is skipped for compressed arrays (already handled by `pad_to_shape`)
+and for chunk groups that span multiple source files (cross-granule merges are
+correctly rejected by `consolidate_chunks`).
+
+To disable:
+
+```python
+vds = open_virtual_mfdataset(..., consolidate=False)
 ```
 
 ---
@@ -726,6 +756,35 @@ independent HTTP range requests per chunk, with no shared HDF5 file handle.
 ---
 
 ## 9. API quick reference
+
+### High-level: TEMPO ragged scanlines + time-concat
+
+```python
+from virtualizarr.xarray import open_virtual_mfdataset
+from virtualizarr.parsers.hdf import HDFParser
+from obstore.store import HTTPStore
+from obspec_utils.registry import ObjectStoreRegistry
+
+BASE = "https://data.asdc.earthdata.nasa.gov/"
+registry = ObjectStoreRegistry({BASE: HTTPStore(BASE)})
+
+# nested_granules: list[list[str]] — outer=scan, inner=granules within scan
+vds = open_virtual_mfdataset(
+    nested_granules,
+    registry=registry,
+    parser=HDFParser(group="/product"),
+    combine="nested",
+    concat_dim=["time", "mirror_step"],   # outer=scans, inner=granules
+    pad="auto",                           # pad ragged mirror_step per scan
+    consolidate=True,                     # default: merge size-1 chunks back
+    preprocess=add_time,                  # inject UTC datetime coord
+    loadable_variables=["latitude", "longitude"],  # inline fixed geostationary grid
+)
+```
+
+`consolidate=True` (default) reduces Dask task count ~100× for TEMPO by merging
+the `chunk_size=1` padding artifacts back to natural per-granule chunk sizes.
+Pass `consolidate=False` only when debugging the manifest structure.
 
 ### High-level: mosaic + time-concat
 
