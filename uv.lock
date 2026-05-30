@@ -968,8 +968,8 @@ wheels = [
 
 [[package]]
 name = "earthaccess"
-version = "0.8.3.dev1233+g1541b00e8"
-source = { git = "https://github.com/betolink/earthaccess.git?rev=virtual-open#1541b00e84aab3fe597578e09ad2cb673cd6b224" }
+version = "0.8.3.dev1234+g5bb8909e2"
+source = { git = "https://github.com/betolink/earthaccess.git?rev=virtual-padding#5bb8909e21656bd2f74bffc78035f9df10f29b99" }
 dependencies = [
     { name = "fsspec" },
     { name = "importlib-resources" },
@@ -3663,7 +3663,7 @@ provides-extras = ["remote", "hdf", "zarr", "netcdf3", "fits", "tiff", "kerchunk
 dev = [
     { name = "codecov" },
     { name = "dask" },
-    { name = "earthaccess", git = "https://github.com/betolink/earthaccess.git?rev=virtual-open" },
+    { name = "earthaccess", git = "https://github.com/betolink/earthaccess.git?rev=virtual-padding" },
     { name = "h5netcdf", specifier = ">=1.8.1" },
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "lithops" },
