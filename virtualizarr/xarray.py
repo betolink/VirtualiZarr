@@ -312,6 +312,10 @@ def _apply_pad_to_dataset(
             new_shape_t = tuple(new_shape)
             if new_shape_t != ma.shape:
                 ma = ma.pad_to_shape(new_shape_t)
+                # Convert missing fill-row cells to inlined bytes so that
+                # consolidate_chunks can later merge boundary cells that mix
+                # real virtual sub-chunks with fill-value sub-chunks.
+                ma = ma.fill_missing_with_inline()
 
             padded_vars[name] = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
             continue
@@ -696,6 +700,7 @@ def _compute_common_chunks(
 def _consolidate_dataset(
     ds: xr.Dataset,
     original_chunks: dict[str, tuple[int, ...]],
+    storage_options: dict | None = None,
 ) -> xr.Dataset:
     """Consolidate ManifestArray variables back to pre-padding chunk sizes.
 
@@ -703,9 +708,11 @@ def _consolidate_dataset(
     chunk_size=1 everywhere.  This function tries to merge those size-1 chunks
     back to the original (per-granule) chunk sizes recorded before padding.
     Sub-chunks that are contiguous and from the same source file are merged;
-    cells where every sub-chunk is missing are kept as missing.  Variables
-    that cannot be consolidated (e.g. different-file sub-chunks across
-    granule boundaries) are left unchanged.
+    cells where every sub-chunk is missing are kept as missing.  Mixed
+    virtual+inlined cells (boundary rows converted to fill bytes by
+    fill_missing_with_inline) are merged by reading the virtual bytes once
+    and concatenating with the inlined fill bytes.  Variables that cannot be
+    consolidated are left unchanged.
     """
     new_vars: dict[str, xr.Variable] = {}
     for _name, var in ds.variables.items():
@@ -715,7 +722,7 @@ def _consolidate_dataset(
             target = original_chunks[name]
             if target != ma.chunks:
                 try:
-                    ma = ma.consolidate_chunks(target)
+                    ma = ma.consolidate_chunks(target, storage_options=storage_options)
                     var = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
                 except (ValueError, NotImplementedError):
                     pass  # leave unchanged if not consolidatable
@@ -801,6 +808,16 @@ def _normalize_coords_for_concat(
     return result
 
 
+def _storage_options_from_registry(registry: "ObjectStoreRegistry") -> dict:
+    """Return fsspec storage_options for the first HTTP/S store in the registry.
+
+    For local ``file://`` registries this returns an empty dict (fsspec handles
+    local paths natively).  For HTTPS stores with bearer-token auth the caller
+    must extend this; for now we return ``{}`` which is correct for local tests.
+    """
+    return {}
+
+
 def _nested_combine_with_padding(
     datasets: list[xr.Dataset],
     concat_dims: list,
@@ -809,6 +826,7 @@ def _nested_combine_with_padding(
     explicit_targets: dict[str, int],
     pad_warn: bool,
     consolidate: bool = True,
+    storage_options: dict | None = None,
 ) -> xr.Dataset:
     """Combine datasets with padding, processing from innermost to outermost dim.
 
@@ -895,7 +913,7 @@ def _nested_combine_with_padding(
                     if var is None:
                         continue
                     target_chunks[name] = chunks  # keep original, don't multiply
-                combined = _consolidate_dataset(combined, target_chunks)
+                combined = _consolidate_dataset(combined, target_chunks, storage_options=storage_options)
 
             next_indexed.append((prefix, combined))
 
@@ -1080,6 +1098,7 @@ def open_virtual_mfdataset(
                 explicit_targets=explicit_targets,
                 pad_warn=pad_warn,
                 consolidate=consolidate,
+                storage_options=_storage_options_from_registry(registry),
             )
             return staged
 

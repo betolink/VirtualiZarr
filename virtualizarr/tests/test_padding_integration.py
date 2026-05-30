@@ -311,20 +311,14 @@ class TestTEMPOIssue487:
         assert result["vertical_column_troposphere"] is not None
         assert result["vertical_column_troposphere"].shape == (2, 264, 2048)
 
-    def test_consolidate_noop_for_ragged_uncompressed(self, tempo_urls, registry):
-        """consolidate=True is a safe no-op when ragged granules produce mixed
-        real+missing sub-chunks in a target cell.
+    def test_consolidate_produces_granule_sized_chunks(self, tempo_urls, registry):
+        """consolidate=True merges chunk_size=1 rows back to granule-sized chunks.
 
-        The TEMPO fixtures have granules of 132 and 131 rows.  After padding to
-        132 and concat to 264, the target chunk (132, 2048) produces:
-          - cell 0: G01 (132 real rows) → consolidatable ✓
-          - cell 1: G02 (131 real + 1 missing) → mixed → ValueError → skip ✗
-
-        Because consolidation requires a uniform chunk size, the whole variable
-        stays at chunk_size=1.  This is correct and safe — no data corruption.
-        The alternative (merging 131 real bytes into a 132-row chunk declaration)
-        causes zarr to raise "cannot reshape array of size 268288 into shape
-        (1,132,2048)" at read time.
+        G01=132 rows (full chunk), G02=131 rows (padded to 132 with inline fill).
+        After consolidation the manifest should have chunks of 132 along mirror_step,
+        not 1.  Previously this was a no-op because mixed real+missing cells raised
+        ValueError; now fill_missing_with_inline converts missing cells to inlined
+        fill bytes first, enabling consolidation.
         """
         scan3 = [tempo_urls[0], tempo_urls[1]]
         scan4 = [tempo_urls[2], tempo_urls[3]]
@@ -345,12 +339,10 @@ class TestTEMPOIssue487:
         no2 = result["vertical_column_troposphere"]
         assert no2.shape == (2, 264, 2048)
 
-        # Mixed real+missing cells → consolidation skipped → stays at chunk_size=1.
-        # This is correct; consolidating would produce a partial-byte chunk that
-        # zarr cannot decode.
         ma = no2.data
-        assert ma.chunks[1] == 1, (
-            f"Expected chunk_size=1 (safe no-op for ragged), got {ma.chunks}"
+        # After consolidation: 2 granule-sized chunks per scan along mirror_step.
+        assert ma.chunks[1] == 132, (
+            f"Expected mirror_step chunk size == 132 after consolidation, got {ma.chunks}"
         )
 
     def test_consolidate_false_preserves_size1_chunks(self, tempo_urls, registry):
@@ -376,6 +368,69 @@ class TestTEMPOIssue487:
         ma = no2.data
         assert ma.chunks[1] == 1, (
             f"Expected mirror_step chunk size == 1 with consolidate=False, got {ma.chunks}"
+        )
+
+    def test_time_series_small_task_graph(self, tempo_urls, registry):
+        """End-to-end: consolidated manifest → small chunk count and correct fill values.
+
+        Two scans × two granules.  Without consolidation each variable has
+        264×2 = 528 chunks along (datescan, mirror_step).  After consolidation
+        each variable has 4 chunks (2 granules × 2 scans): 2 virtual (G01) and
+        2 inlined boundary (G02 131 real rows + 1 fill row).
+        The inlined boundary chunk's last row must be fill_value bytes.
+        """
+        from virtualizarr.manifests.manifest import INLINED_CHUNK_PATH, MISSING_CHUNK_PATH
+
+        scan3 = [tempo_urls[0], tempo_urls[1]]
+        scan4 = [tempo_urls[2], tempo_urls[3]]
+        urls = [scan3, scan4]
+
+        result = open_virtual_mfdataset(
+            urls,
+            registry=registry,
+            parser=HDFParser(group="/product"),
+            combine="nested",
+            concat_dim=["datescan", "mirror_step"],
+            pad="auto",
+            preprocess=self._add_datescan,
+            loadable_variables=[],
+            consolidate=True,
+        )
+
+        no2 = result["vertical_column_troposphere"]
+        assert no2.shape == (2, 264, 2048)
+
+        ma = no2.data
+        # 2 scans × 2 granule slots = 4 chunks total — not 528
+        n_virtual = sum(
+            1 for p in ma.manifest._paths.ravel()
+            if p not in (MISSING_CHUNK_PATH, INLINED_CHUNK_PATH)
+        )
+        n_inlined = len(ma.manifest._inlined)
+        total_chunks = n_virtual + n_inlined
+        assert total_chunks == 4, (
+            f"Expected 4 consolidated chunks, got {total_chunks} "
+            f"({n_virtual} virtual + {n_inlined} inlined)"
+        )
+
+        # Verify the inlined boundary chunk's last row is all fill_value.
+        # The inlined chunk for scan 0 G02 is at manifest grid key (0, 1, 0).
+        import numpy as np
+        fill_value = float(ma.metadata.fill_value)
+        dtype = ma.dtype
+        # Each inlined boundary chunk = (132, 2048) elements
+        inlined_key = (0, 1, 0)
+        assert inlined_key in ma.manifest._inlined, (
+            f"Expected inlined chunk at {inlined_key}, found keys: "
+            f"{list(ma.manifest._inlined.keys())}"
+        )
+        inlined_bytes = ma.manifest._inlined[inlined_key]
+        chunk_arr = np.frombuffer(inlined_bytes, dtype=dtype).reshape(ma.chunks)
+        # Row 131 (last row within this chunk) must be fill_value
+        last_row = chunk_arr[0, 131, :]
+        assert np.all(last_row == fill_value), (
+            f"Expected fill_value={fill_value} in last row of boundary chunk, "
+            f"got {last_row[:5]}"
         )
 
 

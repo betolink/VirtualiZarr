@@ -2,6 +2,8 @@ import dataclasses
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Literal, Union, cast
 
+import fsspec
+
 import numpy as np
 import xarray as xr
 from zarr.core.metadata.v3 import ArrayV3Metadata
@@ -12,7 +14,11 @@ from virtualizarr.manifests.array_api import (
     _isnan,
 )
 from virtualizarr.manifests.indexing import T_Indexer, index
-from virtualizarr.manifests.manifest import MISSING_CHUNK_PATH, ChunkManifest
+from virtualizarr.manifests.manifest import (
+    INLINED_CHUNK_PATH,
+    MISSING_CHUNK_PATH,
+    ChunkManifest,
+)
 from virtualizarr.manifests.utils import (
     ChunkKeySeparator,
     copy_and_replace_metadata,
@@ -588,8 +594,47 @@ class ManifestArray:
         )
         return ManifestArray(metadata=new_meta, chunkmanifest=new_manifest)
 
+    def fill_missing_with_inline(self) -> "ManifestArray":
+        """Replace every missing-chunk cell with an inlined fill-value chunk.
+
+        The fill bytes are computed from ``self.metadata.fill_value`` and
+        ``self.dtype``; no I/O is performed.  The resulting array has no
+        ``MISSING_CHUNK_PATH`` entries — every cell is either a virtual
+        reference or an inlined byte buffer — which allows ``consolidate_chunks``
+        to merge boundary cells that contain a mix of real and fill rows.
+        """
+        grid = determine_chunk_grid_shape(self.shape, self.chunks)
+        missing_mask = np.array(
+            [self.manifest._paths.ravel()[i] == MISSING_CHUNK_PATH for i in range(int(np.prod(grid)))]
+        ).reshape(grid)
+        if not missing_mask.any():
+            return self
+
+        fill_value = self.metadata.fill_value
+        dtype = self.dtype
+        n_elems = int(np.prod(self.chunks))
+        fill_bytes = np.full(n_elems, fill_value, dtype=dtype).tobytes()
+
+        new_paths = self.manifest._paths.copy()
+        new_inlined = dict(self.manifest._inlined)
+        for idx in np.ndindex(*grid):
+            if new_paths[idx] == MISSING_CHUNK_PATH:
+                new_paths[idx] = INLINED_CHUNK_PATH
+                new_inlined[idx] = fill_bytes
+
+        new_manifest = ChunkManifest.from_arrays(
+            paths=new_paths,
+            offsets=self.manifest._offsets.copy(),
+            lengths=self.manifest._lengths.copy(),
+            validate_paths=False,
+            inlined=new_inlined,
+        )
+        return ManifestArray(metadata=self.metadata, chunkmanifest=new_manifest)
+
     def consolidate_chunks(
-        self, target_chunks: tuple[int, ...]
+        self,
+        target_chunks: tuple[int, ...],
+        storage_options: dict | None = None,
     ) -> "ManifestArray":
         """Return a new ManifestArray whose chunk shape is *target_chunks*.
 
@@ -605,12 +650,21 @@ class ManifestArray:
         different source files, or sub-chunks whose byte ranges are not
         contiguous.
 
+        For cells that mix virtual sub-chunks with inlined sub-chunks (produced
+        by ``fill_missing_with_inline``), the virtual bytes are read from the
+        source file and concatenated with the inlined bytes to produce a single
+        inlined target chunk.  ``storage_options`` is forwarded to ``fsspec``
+        for that read; ``None`` works for local ``file://`` paths.
+
         Parameters
         ----------
         target_chunks
             The desired chunk shape after consolidation.  Must satisfy
             ``target_chunks[ax] >= self.chunks[ax]`` on every axis, and each
             ``target_chunks[ax]`` must be a multiple of ``self.chunks[ax]``.
+        storage_options
+            Extra keyword arguments for ``fsspec.open`` when reading virtual
+            sub-chunk bytes for mixed virtual+inlined cells.
         """
         if len(target_chunks) != self.ndim:
             raise ValueError(
@@ -642,10 +696,12 @@ class ManifestArray:
         new_paths = np.full(new_grid, MISSING_CHUNK_PATH, dtype=np.dtypes.StringDType())
         new_offsets = np.zeros(new_grid, dtype=np.dtype("uint64"))
         new_lengths = np.zeros(new_grid, dtype=np.dtype("uint64"))
+        new_inlined: dict[tuple[int, ...], bytes] = {}
 
         src_paths = self.manifest._paths
         src_offsets = self.manifest._offsets
         src_lengths = self.manifest._lengths
+        src_inlined = self.manifest._inlined
 
         for new_idx in np.ndindex(*new_grid):
             # sub-chunk slice in the current grid that maps into this target cell
@@ -662,61 +718,106 @@ class ManifestArray:
             flat_offsets = sub_offsets.ravel().astype(np.int64)
             flat_lengths = sub_lengths.ravel().astype(np.int64)
 
-            # filter out missing sub-chunks
-            valid_mask = np.array([p != MISSING_CHUNK_PATH for p in flat_paths])
-            if not valid_mask.any():
+            # classify sub-chunks
+            is_missing = np.array([p == MISSING_CHUNK_PATH for p in flat_paths])
+            is_inlined = np.array([p == INLINED_CHUNK_PATH for p in flat_paths])
+            is_virtual = ~is_missing & ~is_inlined
+
+            if is_missing.all():
                 # all missing → emit missing target chunk (already initialised)
                 continue
 
-            if not valid_mask.all():
-                # mixed real+missing: the real sub-chunks cover fewer bytes than
-                # the declared target chunk shape requires.  Merging them would
-                # produce a manifest entry whose byte length is smaller than
-                # shape × itemsize, causing a reshape error at read time for
-                # uncompressed arrays.  Raise so the caller can skip this variable.
+            if is_inlined.all():
+                # all inlined → concatenate bytes in sub-chunk order
+                combined = b""
+                for sub_idx in np.ndindex(*sub_paths.shape):
+                    abs_idx = tuple(
+                        new_idx[ax] * ratio[ax] + sub_idx[ax]
+                        for ax in range(self.ndim)
+                    )
+                    combined += src_inlined[abs_idx]
+                new_paths[new_idx] = INLINED_CHUNK_PATH
+                new_inlined[new_idx] = combined
+                continue
+
+            if is_virtual.all():
+                # all virtual → existing merge logic (same file, contiguous)
+                virtual_paths = flat_paths[is_virtual]
+                virtual_offsets = flat_offsets[is_virtual]
+                virtual_lengths = flat_lengths[is_virtual]
+
+                first_path = virtual_paths[0]
+                if not np.all(np.array([p == first_path for p in virtual_paths])):
+                    raise ValueError(
+                        f"Cannot consolidate target chunk {new_idx}: sub-chunks "
+                        "span more than one source file."
+                    )
+
+                order = np.argsort(virtual_offsets)
+                sorted_offsets = virtual_offsets[order]
+                sorted_lengths = virtual_lengths[order]
+
+                ends = sorted_offsets + sorted_lengths
+                if not np.all(ends[:-1] == sorted_offsets[1:]):
+                    raise ValueError(
+                        f"Cannot consolidate target chunk {new_idx}: byte ranges "
+                        "are not contiguous."
+                    )
+
+                new_paths[new_idx] = first_path
+                new_offsets[new_idx] = np.uint64(int(sorted_offsets[0]))
+                new_lengths[new_idx] = np.uint64(int(ends[-1] - sorted_offsets[0]))
+                continue
+
+            # mixed virtual + inlined: read the virtual bytes from the source file
+            # and concatenate with the inlined bytes in sub-chunk order.
+            virtual_paths = flat_paths[is_virtual]
+            virtual_offsets = flat_offsets[is_virtual]
+            virtual_lengths = flat_lengths[is_virtual]
+
+            first_path = virtual_paths[0]
+            if not np.all(np.array([p == first_path for p in virtual_paths])):
                 raise ValueError(
-                    f"Cannot consolidate target chunk {new_idx}: cell contains "
-                    "a mix of real and missing sub-chunks.  The real bytes would "
-                    "not fill the declared target chunk shape."
+                    f"Cannot consolidate target chunk {new_idx}: mixed-source "
+                    "virtual sub-chunks span more than one file."
                 )
 
-            valid_paths = flat_paths[valid_mask]
-            valid_offsets = flat_offsets[valid_mask]
-            valid_lengths = flat_lengths[valid_mask]
-
-            # all sub-chunks must point to the same file
-            first_path = valid_paths[0]
-            if not np.all(np.array([p == first_path for p in valid_paths])):
-                raise ValueError(
-                    f"Cannot consolidate target chunk {new_idx}: sub-chunks "
-                    "span more than one source file."
-                )
-
-            # sort by offset so we can check contiguity regardless of array order
-            order = np.argsort(valid_offsets)
-            sorted_offsets = valid_offsets[order]
-            sorted_lengths = valid_lengths[order]
-
-            # check contiguity: each chunk's end == next chunk's start
+            order = np.argsort(virtual_offsets)
+            sorted_offsets = virtual_offsets[order]
+            sorted_lengths = virtual_lengths[order]
             ends = sorted_offsets + sorted_lengths
             if not np.all(ends[:-1] == sorted_offsets[1:]):
                 raise ValueError(
-                    f"Cannot consolidate target chunk {new_idx}: byte ranges "
-                    "are not contiguous."
+                    f"Cannot consolidate target chunk {new_idx}: virtual byte "
+                    "ranges are not contiguous."
                 )
 
-            merged_offset = int(sorted_offsets[0])
-            merged_length = int(ends[-1] - sorted_offsets[0])
+            read_offset = int(sorted_offsets[0])
+            read_length = int(ends[-1] - sorted_offsets[0])
+            so = storage_options or {}
+            with fsspec.open(first_path, "rb", **so) as fh:
+                fh.seek(read_offset)
+                virtual_bytes = fh.read(read_length)
 
-            new_paths[new_idx] = first_path
-            new_offsets[new_idx] = np.uint64(merged_offset)
-            new_lengths[new_idx] = np.uint64(merged_length)
+            # append inlined bytes in grid order after the virtual block
+            inline_bytes = b""
+            for sub_idx in np.ndindex(*sub_paths.shape):
+                abs_idx = tuple(
+                    new_idx[ax] * ratio[ax] + sub_idx[ax]
+                    for ax in range(self.ndim)
+                )
+                if abs_idx in src_inlined:
+                    inline_bytes += src_inlined[abs_idx]
+
+            new_paths[new_idx] = INLINED_CHUNK_PATH
+            new_inlined[new_idx] = virtual_bytes + inline_bytes
 
         new_manifest = ChunkManifest.from_arrays(
             paths=new_paths,
             offsets=new_offsets,
             lengths=new_lengths,
             validate_paths=False,
+            inlined=new_inlined if new_inlined else None,
         )
         new_meta = copy_and_replace_metadata(
             self.metadata,
