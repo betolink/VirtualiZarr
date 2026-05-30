@@ -283,55 +283,80 @@ def _apply_pad_to_dataset(
     targets: dict[str, int],
     target_chunks_map: dict[str, tuple[int, ...]] | None = None,
 ) -> tuple[xr.Dataset, dict[str, int]]:
-    """Pad a Dataset's ManifestArray-backed variables to given dim targets,
-    then normalize chunk shapes if *target_chunks_map* is provided.
+    """Pad all variables (virtual and loaded) to given dim targets.
 
     Returns (padded_ds, report_dict) where report_dict maps dim -> target.
     """
     report: dict[str, int] = {}
     padded_vars: dict[str, xr.Variable] = {}
+
     for _name, var in ds.variables.items():
         name = cast(str, _name)
-        if not _is_virtual_variable(var):
-            continue
-        ma: ManifestArray = var.data
 
-        new_shape = list(ma.shape)
-        for ax, (_dim_name, old_len) in enumerate(zip(var.dims, ma.shape)):
+        # --- virtual variables: pad ManifestArray ---
+        if _is_virtual_variable(var):
+            ma: ManifestArray = var.data
+            new_shape = list(ma.shape)
+            for ax, (_dim_name, old_len) in enumerate(zip(var.dims, ma.shape)):
+                dim_name = cast(str, _dim_name)
+                t = targets.get(dim_name)
+                if t is not None and t > old_len:
+                    new_shape[ax] = t
+                    report[dim_name] = max(report.get(dim_name, 0), t)
+
+            if target_chunks_map and name in target_chunks_map:
+                tc = target_chunks_map[name]
+                if tuple(tc) != tuple(ma.chunks):
+                    ma = ma._remap_chunks(tc)
+
+            new_shape_t = tuple(new_shape)
+            if new_shape_t != ma.shape:
+                ma = ma.pad_to_shape(new_shape_t)
+
+            padded_vars[name] = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
+            continue
+
+        # --- loaded variables: pad numpy array if needed ---
+        new_shape = list(var.shape)
+        needs_pad = False
+        for ax, _dim_name in enumerate(var.dims):
             dim_name = cast(str, _dim_name)
             t = targets.get(dim_name)
-            if t is not None and t > old_len:
+            if t is not None and t > new_shape[ax]:
                 new_shape[ax] = t
+                needs_pad = True
                 report[dim_name] = max(report.get(dim_name, 0), t)
 
-        if target_chunks_map and name in target_chunks_map:
-            tc = target_chunks_map[name]
-            if tuple(tc) != tuple(ma.chunks):
-                ma = ma._remap_chunks(tc)
+        if needs_pad:
+            arr = var.values
+            pad_width: list[tuple[int, int]] = []
+            for ax, _dim_name in enumerate(var.dims):
+                dim_name = cast(str, _dim_name)
+                t = targets.get(dim_name)
+                old_len = var.shape[ax]
+                if t is not None and t > old_len:
+                    pad_width.append((0, t - old_len))
+                else:
+                    pad_width.append((0, 0))
 
-        new_shape_t = tuple(new_shape)
-        if new_shape_t != ma.shape:
-            ma = ma.pad_to_shape(new_shape_t)
+            # Determine fill value
+            fv = var.attrs.get("_FillValue")
+            if fv is None:
+                fv = var.attrs.get("missing_value")
+            if fv is None:
+                if np.issubdtype(var.dtype, np.floating):
+                    fv = float("nan")
+                elif np.issubdtype(var.dtype, np.integer):
+                    fv = 0
+                else:
+                    fv = None
 
-        padded_vars[name] = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
-
-    for _name, var in ds.variables.items():
-        name = cast(str, _name)
-        if name not in padded_vars:
+            padded_arr = np.pad(arr, pad_width, mode="constant", constant_values=fv)
+            padded_vars[name] = xr.Variable(
+                data=padded_arr, dims=var.dims, attrs=var.attrs
+            )
+        else:
             padded_vars[name] = var
-
-    for dim in targets:
-        old_size = ds.sizes.get(dim)
-        new_size = report.get(dim)
-        if old_size is not None and new_size is not None and old_size != new_size:
-            coord_var = ds.variables.get(dim)
-            if coord_var is not None and coord_var.dims == (dim,):
-                if not _is_virtual_variable(coord_var):
-                    raise ValueError(
-                        f"Padded dimension '{dim}' from {old_size} to "
-                        f"{new_size}, but a loaded 1D coordinate variable "
-                        f"exists. Drop it in your preprocess function."
-                    )
 
     new_ds = construct_fully_virtual_dataset(padded_vars, attrs=ds.attrs)
     return new_ds, report
@@ -696,7 +721,8 @@ def _normalize_coords_for_concat(
 
     result = list(datasets)
 
-    # collect every non-concat dimension that is present as a 1-D coord
+    # collect every non-concat dimension that is present as a *loaded* 1-D coord
+    # (skip virtual ManifestArray coords — assign_coords does not support them)
     dims_to_fix: set[str] = set()
     for ds in result:
         for _dim in ds.dims:
@@ -704,7 +730,8 @@ def _normalize_coords_for_concat(
             if dim == concat_dim:
                 continue
             if dim in ds.coords and ds.coords[dim].dims == (dim,):
-                dims_to_fix.add(dim)
+                if not _is_virtual_variable(ds.coords[dim]):
+                    dims_to_fix.add(dim)
 
     for dim in dims_to_fix:
         # pick a reference coord from the first dataset that carries it
