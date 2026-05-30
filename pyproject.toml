@@ -132,6 +132,7 @@ dev = [
     "odc-stac>=0.5.2",
     "h5py>=3.16.0",
     "pystac-client>=0.9.0",
+    "earthaccess @ git+https://github.com/betolink/earthaccess.git@virtual-open",
 ]
 
 [project.urls]
