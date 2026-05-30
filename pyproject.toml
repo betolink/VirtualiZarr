@@ -129,6 +129,9 @@ dev = [
     "s3fs",
     "lithops",
     "dask",
+    "odc-stac>=0.5.2",
+    "h5py>=3.16.0",
+    "pystac-client>=0.9.0",
 ]
 
 [project.urls]

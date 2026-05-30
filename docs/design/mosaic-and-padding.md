@@ -490,6 +490,50 @@ compute    (local):     ~0.9 s
 
 The VirtualiZarr code path is identical. The difference is purely network latency.
 
+### 6.4 Comparison with odc-stac (real S3, 20 granules)
+
+`odc-stac` is a rasterio-based stacking library commonly used with COG/GeoTIFF assets.
+It can also read NetCDF files via `/vsicurl/` URLs, but every file is downloaded
+**whole** because HDF5 requires random access to the file structure. This makes it
+much slower than VirtualiZarr's chunk-level access for the same dataset.
+
+| Metric | VirtualiZarr | odc-stac (10 workers) |
+|---|---|---|
+| Total time | ~25 s | ~36 s |
+| Data transferred | ~12 MB (chunk-level) | ~120 MB (whole files) |
+| Grid | Native `(20, 2560, 2048)` | Snapped `(20, 2561, 2050)` |
+| Parallelism | Yes (chunk-level, thread-safe) | Yes (process-safe, 10 workers) |
+| Reprojection | None | Nearest-neighbor warp |
+
+**VirtualiZarr is ~40% faster** despite transferring 10× less data, because it reads
+only the chunks touched by the computation. odc-stac downloads each ~6 MB file in
+its entirety, then warps it onto a snapped target grid.
+
+### 6.5 Scientific accuracy: native grid vs reprojection
+
+VirtualiZarr and odc-stac produce different pixel values at the edges because their
+spatial models differ:
+
+| Aspect | VirtualiZarr | odc-stac |
+|---|---|---|
+| **Pixel value** | Exact original measurement | Interpolated from nearest source pixel |
+| **Sub-pixel shift** | None (native grid) | Up to ±60 m (half-pixel from grid snapping) |
+| **Edge behaviour** | Fill value where no data exists | Warped from nearest source (may bleed in) |
+| **Repeatability** | Perfect (same byte every time) | Depends on grid snapping parameters |
+
+For ITS-LIVE, the native chunk grid is `(1, 512, 512)` with 120 m pixels. The mosaic
+pipeline places each granule at its exact chunk-aligned offset. A `mean("time")`
+at the centre of the union tile averages the **exact same physical pixel** across
+all 20 granules, with no resampling noise.
+
+odc-stac constructs a new target `GeoBox` snapped to the CRS origin. Pixel edges
+align to `N × 120 m`, which may shift the grid by up to half a pixel relative to
+the native Landsat sub-tile alignment. The resulting values differ at ~27k edge
+pixels (out of 5.2 M), with a mean absolute difference of ~37 m/y.
+
+For change-detection or time-series analysis, VirtualiZarr's preservation of the
+native grid eliminates resampling artifacts that can introduce spurious trends.
+
 ---
 
 ## 7. Real-world STAC scenario: 100 granules from one UTM tile
@@ -638,13 +682,29 @@ one GET per chunk key, which can cover multiple time steps in a single contiguou
 request when the file layout allows. This explains the 308 vs 1018 GET count
 difference in the Malaspina benchmark (both transfer the same bytes).
 
-### 8.4 `time` coordinate uniqueness
+### 8.4 Nodata / fill-value handling
+
+VirtualiZarr preserves the raw pixel values (including the fill value, e.g.
+`-32767` for ITS-LIVE `int16` arrays). The user must mask them before computing
+statistics:
+
+```python
+fill_value = ds["v"].encoding.get("_FillValue", -32767)
+result = ds["v"].where(ds["v"] != fill_value).mean("time", skipna=True)
+```
+
+This is consistent with xarray's zarr/kerchunk backend, which stores `_FillValue`
+in `.encoding` but does not auto-mask it during `.compute()`. In contrast,
+odc-stac (via rasterio) converts nodata pixels to `NaN` automatically, but may
+still leave edge artifacts from nearest-neighbor warping.
+
+### 8.5 `time` coordinate uniqueness
 
 `xr.concat(dim="time")` will raise if two granules share the same timestamp. STAC
 queries sometimes return duplicate granules (e.g. reprocessing events). Deduplicate
 upstream or pass `compat="override"` if duplicates are acceptable.
 
-### 8.5 Object-dtype HDF5 variables
+### 8.6 Object-dtype HDF5 variables
 
 Variables stored as HDF5 variable-length strings (e.g. `mapping`, `img_pair_info`
 in ITS-LIVE NetCDF-4 files) cannot be represented in zarr v3. Use:
@@ -652,6 +712,16 @@ in ITS-LIVE NetCDF-4 files) cannot be represented in zarr v3. Use:
 ```python
 parser=HDFParser(drop_variables=["mapping", "img_pair_info"])
 ```
+
+### 8.7 Parallelism with HDF5-backed assets
+
+HDF5 is **not thread-safe**. If you use odc-stac with NetCDF/HDF5 assets, you
+must use a **process-based** scheduler (`scheduler="processes"`) or odc-stac's
+`pool=ProcessPoolExecutor(...)`. Thread-based parallelism will corrupt the HDF5
+global state and produce `errno = 2` errors.
+
+VirtualiZarr does not have this limitation because `h5py` + `obstore` issue
+independent HTTP range requests per chunk, with no shared HDF5 file handle.
 
 ---
 
