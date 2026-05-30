@@ -32,6 +32,11 @@ dependencies = [
     "obspec_utils>=0.9.0",
     "kerchunk>=0.2.10",
     "arro3-core>=0.8.0",
+    "jupyterlab>=4.5.7",
+    "dask>=2026.3.0",
+    "distributed>=2026.3.0",
+    "coiled>=1.134.1",
+    "dask-labextension>=7.0.0",
 ]
 
 # Dependency sets under optional-dependencies are available via PyPI
