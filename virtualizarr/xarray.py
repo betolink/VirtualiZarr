@@ -266,9 +266,10 @@ def _compute_pad_targets(
     dim_sets: dict[str, set[int]] = {}
     for ds in datasets:
         for dim, size in ds.sizes.items():
-            if scope_dims is not None and dim not in scope_dims:
+            dim_s = cast(str, dim)
+            if scope_dims is not None and dim_s not in scope_dims:
                 continue
-            dim_sets.setdefault(dim, set()).add(size)
+            dim_sets.setdefault(dim_s, set()).add(size)
 
     targets: dict[str, int] = {}
     for dim, sizes in dim_sets.items():
@@ -289,13 +290,15 @@ def _apply_pad_to_dataset(
     """
     report: dict[str, int] = {}
     padded_vars: dict[str, xr.Variable] = {}
-    for name, var in ds.variables.items():
+    for _name, var in ds.variables.items():
+        name = cast(str, _name)
         if not _is_virtual_variable(var):
             continue
         ma: ManifestArray = var.data
 
         new_shape = list(ma.shape)
-        for ax, (dim_name, old_len) in enumerate(zip(var.dims, ma.shape)):
+        for ax, (_dim_name, old_len) in enumerate(zip(var.dims, ma.shape)):
+            dim_name = cast(str, _dim_name)
             t = targets.get(dim_name)
             if t is not None and t > old_len:
                 new_shape[ax] = t
@@ -312,7 +315,8 @@ def _apply_pad_to_dataset(
 
         padded_vars[name] = xr.Variable(data=ma, dims=var.dims, attrs=var.attrs)
 
-    for name, var in ds.variables.items():
+    for _name, var in ds.variables.items():
+        name = cast(str, _name)
         if name not in padded_vars:
             padded_vars[name] = var
 
@@ -507,7 +511,8 @@ def _apply_mosaic_to_dataset(
     # union shape for each mosaic dim
     union_sizes = {dim: int(union_coords[dim].size) for dim in mosaic_dims}
 
-    for name, var in ds.variables.items():
+    for _name, var in ds.variables.items():
+        name = cast(str, _name)
         if not _is_virtual_variable(var):
             # Replace loaded 1-D coord if it is a mosaic dim
             if var.dims == (name,) and name in mosaic_dims:
@@ -524,7 +529,7 @@ def _apply_mosaic_to_dataset(
 
         # check whether any mosaic dim appears in this variable's dimensions
         mosaic_axes = [
-            ax for ax, d in enumerate(dims) if d in mosaic_dims
+            ax for ax, d in enumerate(dims) if cast(str, d) in mosaic_dims
         ]
         if not mosaic_axes:
             new_vars[name] = var
@@ -636,11 +641,12 @@ def _compute_common_chunks(
     var_dims: dict[str, tuple[str, ...]] = {}
     var_compressed: dict[str, bool] = {}  # True if ANY array for this var is compressed
     for ds in datasets:
-        for name, var in ds.variables.items():
+        for _name, var in ds.variables.items():
+            name = cast(str, _name)
             if _is_virtual_variable(var):
                 ma = var.data
                 var_chunks.setdefault(name, set()).add(ma.chunks)
-                var_dims.setdefault(name, var.dims)
+                var_dims.setdefault(name, cast("tuple[str, ...]", var.dims))
                 if not is_uncompressed(ma):
                     var_compressed[name] = True
 
@@ -673,6 +679,50 @@ def _emit_pad_warning(report: dict[str, int], stage: str = "") -> None:
     )
 
 
+def _normalize_coords_for_concat(
+    datasets: list[xr.Dataset],
+    concat_dim: str,
+) -> list[xr.Dataset]:
+    """Ensure all datasets share identical 1-D coords for non-concat dims.
+
+    ``xr.concat`` with ``join='outer'`` tries to align every non-concat
+    dimension.  When coordinate values differ (even if shapes match),
+    xarray issues fancy-index reindexers that ``ManifestArray`` does not
+    support.  We side-step that by copying a reference coordinate
+    (taken from the first dataset that has it) to every other dataset.
+    """
+    if len(datasets) <= 1:
+        return datasets
+
+    result = list(datasets)
+
+    # collect every non-concat dimension that is present as a 1-D coord
+    dims_to_fix: set[str] = set()
+    for ds in result:
+        for _dim in ds.dims:
+            dim = cast(str, _dim)
+            if dim == concat_dim:
+                continue
+            if dim in ds.coords and ds.coords[dim].dims == (dim,):
+                dims_to_fix.add(dim)
+
+    for dim in dims_to_fix:
+        # pick a reference coord from the first dataset that carries it
+        ref = None
+        for ds in result:
+            if dim in ds.coords:
+                ref = ds.coords[dim]
+                break
+        if ref is None:
+            continue
+
+        for i, ds in enumerate(result):
+            if dim in ds.coords:
+                result[i] = ds.assign_coords({dim: ref})
+
+    return result
+
+
 def _nested_combine_with_padding(
     datasets: list[xr.Dataset],
     concat_dims: list,
@@ -685,20 +735,25 @@ def _nested_combine_with_padding(
     total_report: dict[str, int] = {}
     step_ids: list = list(ids)
 
+    def _pad_and_normalize(parts_list: list[xr.Dataset], dim: str) -> list[xr.Dataset]:
+        """Apply padding + chunk normalisation + coord normalisation."""
+        auto = _compute_pad_targets(parts_list, pad_scope)
+        targets = {**auto, **explicit_targets}
+        chunk_map = _compute_common_chunks(parts_list, pad_dims=set(targets.keys()))
+        if targets or chunk_map:
+            padded: list[xr.Dataset] = []
+            for ds in parts_list:
+                ds_padded, report = _apply_pad_to_dataset(ds, targets, chunk_map)
+                padded.append(ds_padded)
+                total_report.update(report)
+            parts_list = padded
+        return _normalize_coords_for_concat(parts_list, dim)
+
     for level, dim in enumerate(concat_dims):
         if len(parts) == 1:
             break
 
-        auto = _compute_pad_targets(parts, pad_scope)
-        targets = {**auto, **explicit_targets}
-        chunk_map = _compute_common_chunks(parts, pad_dims=set(targets.keys()))
-        if targets or chunk_map:
-            padded = []
-            for ds in parts:
-                ds2, rep = _apply_pad_to_dataset(ds, targets, chunk_map)
-                padded.append(ds2)
-                total_report.update(rep)
-            parts = padded
+        parts = _pad_and_normalize(parts, dim)
 
         if level < len(concat_dims) - 1 and step_ids and len(step_ids[0]) > 1:
             depth = level + 1
@@ -712,19 +767,10 @@ def _nested_combine_with_padding(
                 next_ids.append(prefix)
             parts, step_ids = next_parts, next_ids
         else:
-            result = xr.concat(parts, dim=dim)
-            parts = [result]
+            parts = [xr.concat(parts, dim=dim)]
 
-        auto2 = _compute_pad_targets(parts, pad_scope)
-        targets2 = {**auto2, **explicit_targets}
-        chunk_map2 = _compute_common_chunks(parts, pad_dims=set(targets2.keys()))
-        if targets2 or chunk_map2:
-            padded2 = []
-            for ds in parts:
-                ds3, rep2 = _apply_pad_to_dataset(ds, targets2, chunk_map2)
-                padded2.append(ds3)
-                total_report.update(rep2)
-            parts = padded2
+        # After concat shapes may have changed; re-apply padding if needed.
+        parts = _pad_and_normalize(parts, dim)
 
     if pad_warn:
         _emit_pad_warning(total_report)
@@ -896,7 +942,7 @@ def open_virtual_mfdataset(
         elif combine == "nested":
             staged = _nested_combine_with_padding(
                 virtual_datasets,
-                concat_dims=concat_dim,
+                concat_dims=cast("list[Any]", concat_dim),
                 ids=ids,
                 pad_scope=pad_scope,
                 explicit_targets=explicit_targets,

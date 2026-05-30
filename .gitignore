@@ -194,3 +194,6 @@ output
 
 # Test fixtures (generated/cached locally, not committed)
 virtualizarr/tests/fixtures/
+
+# Generated stores (kerchunk parquet dirs, icechunk repos, etc.)
+stores/

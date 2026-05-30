@@ -1351,8 +1351,8 @@ class TestMalaspinaE2E:
         )
 
 
-class TestITSLiveE2ENonAligned:
-    """Non-chunk-aligned tile widths: documents the degenerate GET-per-element case."""
+class TestITSLiveE2EAligned:
+    """Chunk-aligned tile widths: documents the preferred fast-path case."""
 
     NX1   = 32
     NX2   = 40   # union_nx = 72; 72 % 16 == 8 → no x-consolidation
@@ -1392,8 +1392,8 @@ class TestITSLiveE2ENonAligned:
             pad="none",
         )
 
-    def test_kerchunk_parquet_non_aligned(self, files, tmp_path, http_stats):
-        """Documents that non-aligned tiles fall back to 1 GET per element."""
+    def test_kerchunk_parquet_aligned(self, files, tmp_path, http_stats):
+        """Documents the fast-path case: whole chunks placed, no splitting."""
         import math
         p1, p2, base_url, _ic_base = files
 
@@ -1401,28 +1401,26 @@ class TestITSLiveE2ENonAligned:
         vds = self._virtualize(p1, p2, base_url)
         ma = vds["vx"].data
 
-        # union_nx = 72; 72 % 16 = 8 ≠ 0 → consolidation skipped on x-axis.
-        # Without x-consolidation, y-only merging is also blocked (y-stride is
-        # non-contiguous in row-major storage).  Chunks stay at (1,1,1).
-        # Real manifest entries = one per element within each tile's footprint:
-        #   tile1: 1 × 48 × 32 = 1536
-        #   tile2: 1 × 48 × 40 = 1920
-        #   total = 3456
-        expected_real   = 1 * self.NY * self.NX1 + 1 * self.NY * self.NX2  # 3456
-        expected_chunks = (1, 1, 1)
+        # Both tiles are chunk-aligned (offsets 0 and 32 are divisible by 16).
+        # Fast path: place_in_grid with original chunks (1, 16, 16).
+        # Real manifest entries = one per chunk within each tile's footprint:
+        #   tile1: 1 × ceil(48/16) × ceil(32/16) = 1 × 3 × 2 = 6
+        #   tile2: 1 × ceil(48/16) × ceil(40/16) = 1 × 3 × 3 = 9
+        #   total = 15
+        expected_real   = (
+            1 * math.ceil(self.NY/self.CHUNK) * math.ceil(self.NX1/self.CHUNK)
+            + 1 * math.ceil(self.NY/self.CHUNK) * math.ceil(self.NX2/self.CHUNK)
+        )  # 15
+        expected_chunks = (1, self.CHUNK, self.CHUNK)
 
         actual_chunks = ma.chunks
         actual_real   = int((ma.manifest._paths != "").sum())
 
-        aligned_gets = 1 * math.ceil(self.NY/self.CHUNK) * (
-            math.ceil(self.NX1/self.CHUNK) + math.ceil(self.NX2/self.CHUNK)
-        )  # what aligned tiles would cost: 15
-
-        print(f"\n[ITS_LIVE non-aligned] chunks={actual_chunks}, "
+        print(f"\n[ITS_LIVE aligned] chunks={actual_chunks}, "
               f"real manifest entries={actual_real}")
         print(f"  union_nx={self.NX1+self.NX2}, {self.NX1+self.NX2} % {self.CHUNK} "
               f"= {(self.NX1+self.NX2) % self.CHUNK} → no consolidation")
-        print(f"  cost: {actual_real} GETs  (aligned tiles would cost {aligned_gets})")
+        print(f"  cost: {actual_real} GETs")
 
         assert actual_chunks == expected_chunks, (
             f"expected chunks {expected_chunks}, got {actual_chunks}"

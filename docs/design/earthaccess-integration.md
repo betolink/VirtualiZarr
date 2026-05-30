@@ -253,7 +253,7 @@ That's it — about 10 lines of changes.
 5. Example usage after the patch
 ----------------------------------
 
-**TEMPO (ragged scanlines):**
+**TEMPO (ragged scanlines, multiple groups):**
 
 ```python
 import earthaccess
@@ -263,14 +263,28 @@ granules = earthaccess.search_data(
     temporal=("2024-03-28", "2024-03-29"),
 )
 
-vds = earthaccess.virtualize(
+# Group 1: product variables
+product = earthaccess.virtualize(
     granules,
+    group="product",
     concat_dim="time",
     loadable_variables=["time", "latitude", "longitude"],
-    pad="auto",           # pad ragged y dimension to union
+    pad="auto",
 )
 
-vds.vz.to_kerchunk("tempo_day.json", format="json")
+# Group 2: geolocation variables
+geolocation = earthaccess.virtualize(
+    granules,
+    group="geolocation",
+    concat_dim="time",
+    loadable_variables=["time", "latitude", "longitude"],
+    pad="auto",
+)
+
+# Merge groups into one Dataset
+import xarray as xr
+result = xr.merge([product, geolocation])
+result.vz.to_kerchunk("tempo_day.json", format="json")
 ```
 
 **ITS-LIVE (spatial mosaic):**
@@ -287,7 +301,6 @@ vds = earthaccess.virtualize(
     mosaic_dims=["y", "x"],
     loadable_variables=["y", "x", "time"],
     pad="none",
-    parser="HDFParser",
 )
 
 vds.vz.to_kerchunk("itslive_mosaic.json", format="json")
