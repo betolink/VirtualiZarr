@@ -1330,8 +1330,8 @@ wheels = [
 
 [[package]]
 name = "earthaccess"
-version = "0.8.3.dev1239+g6453d3fda"
-source = { git = "https://github.com/betolink/earthaccess.git?rev=virtual-padding#6453d3fdacb9e88a02883ce3b8b82c84a457db4d" }
+version = "0.8.3.dev1240+g3f2f6bdd2"
+source = { git = "https://github.com/betolink/earthaccess.git?rev=virtual-padding#3f2f6bdd2bbb8c8827832bf61cfa1f1c51f76c2a" }
 dependencies = [
     { name = "fsspec" },
     { name = "importlib-resources" },
