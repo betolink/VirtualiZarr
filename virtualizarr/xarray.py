@@ -809,12 +809,30 @@ def _normalize_coords_for_concat(
 
 
 def _storage_options_from_registry(registry: "ObjectStoreRegistry") -> dict:
-    """Return fsspec storage_options for the first HTTP/S store in the registry.
+    """Return fsspec storage_options for the first HTTPS store in the registry.
 
-    For local ``file://`` registries this returns an empty dict (fsspec handles
-    local paths natively).  For HTTPS stores with bearer-token auth the caller
-    must extend this; for now we return ``{}`` which is correct for local tests.
+    Extracts the Bearer token from an ``obstore`` ``HTTPStore`` (if present) and
+    converts it to fsspec ``{"headers": {"Authorization": "Bearer <token>"}}``
+    so that ``fsspec.open`` can read boundary chunks from authenticated DAAC URLs.
+
+    For local ``file://`` registries returns ``{}`` (fsspec handles local paths
+    without extra options).
     """
+    try:
+        for store in registry._iter_stores():
+            store_type = type(store).__name__
+            if store_type == "HTTPStore":
+                client_opts = getattr(store, "client_options", {}) or {}
+                headers = client_opts.get("default_headers", {})
+                if headers:
+                    # obstore stores header values as bytes; fsspec wants str
+                    str_headers = {
+                        k: v.decode() if isinstance(v, bytes) else v
+                        for k, v in headers.items()
+                    }
+                    return {"headers": str_headers}
+    except Exception:
+        pass
     return {}
 
 
